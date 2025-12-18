@@ -637,8 +637,8 @@ public class EmiScreenManager {
 					context.drawTextWithShadow(EmiPort.translatable("emi.reloading.waiting"), reloadInfoX, screenHeight - 16);
 				} else {
 					context.drawTextWithShadow(EmiPort.translatable("emi.reloading"), reloadInfoX, screenHeight - 16);
-					context.drawTextWithShadow(EmiReloadManager.reloadStep, reloadInfoX, screenHeight - 26);
-					if (System.currentTimeMillis() > EmiReloadManager.reloadWorry) {
+					context.drawTextWithShadow(EmiReloadManager.stepText(), reloadInfoX, screenHeight - 26);
+					if (EmiReloadManager.shouldWorry()) {
 						context.drawTextWithShadow(EmiPort.translatable("emi.reloading.worry"), reloadInfoX, screenHeight - 36);
 					}
 				}
@@ -868,7 +868,7 @@ public class EmiScreenManager {
 			for (EmiFavorite.Synthetic fav : syntheticFavorites) {
 				synfavs.addAll(fav.getEmiStacks());
 			}
-			
+
 			try {
 				HandledScreen<?> hs = EmiApi.getHandledScreen();
 				for (EmiRecipeHandler handler : EmiRecipeFiller.getAllHandlers(hs)) {
@@ -1373,7 +1373,7 @@ public class EmiScreenManager {
 			return false;
 		}
 	}
-	
+
 	private static boolean deleteCursor(int mx, int my) {
 		if (client.currentScreen instanceof HandledScreen<?> handled) {
 			ItemStack cursor = handled.getScreenHandler().getCursorStack();

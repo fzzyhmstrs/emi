@@ -18,6 +18,7 @@ class StandardMoveGenerator extends MoveGenerator {
 	public void ponderMove(ChessBoard board) {
 		chosenMove = null;
 		worker = new Thread(new Worker(board));
+		worker.setName("EMI Move Ponderer");
 		worker.start();
 	}
 
@@ -60,7 +61,7 @@ class StandardMoveGenerator extends MoveGenerator {
 		}
 		return alpha;
 	}
-	
+
 	class Worker implements Runnable {
 		private ChessBoard board;
 

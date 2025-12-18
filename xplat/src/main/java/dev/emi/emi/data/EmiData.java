@@ -31,10 +31,10 @@ import net.minecraft.util.JsonHelper;
 public class EmiData {
 	public static Map<String, EmiRecipeCategoryProperties> categoryPriorities = Map.of();
 	public static List<Predicate<EmiRecipe>> recipeFilters = List.of();
-	public static List<Supplier<IndexStackData>> stackData = List.of();
+	public static volatile List<Supplier<IndexStackData>> stackData = List.of();
 	public static List<Supplier<EmiAlias>> aliases = List.of();
 	public static List<Supplier<EmiRecipe>> recipes = List.of();
-	
+
 	public static void init(Consumer<EmiResourceReloadListener> register) {
 		register.accept(new RecipeDefaultLoader());
 		register.accept(new EmiTagExclusionsLoader());

@@ -4,6 +4,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
 
 import com.google.common.collect.Lists;
@@ -13,7 +14,6 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 
 import dev.emi.emi.EmiPort;
-import dev.emi.emi.api.stack.Comparison;
 import dev.emi.emi.api.stack.EmiIngredient;
 import dev.emi.emi.api.stack.EmiStack;
 import dev.emi.emi.api.stack.serializer.EmiIngredientSerializer;
@@ -23,9 +23,9 @@ import dev.emi.emi.registry.EmiStackList;
 
 public class EmiHidden {
 	// Data loaded
-	public static Set<EmiIngredient> disabledStacks = Sets.newHashSet();
-	public static List<IndexStackData.Filter> disabledFilters = Lists.newArrayList();
-	public static Map<String, Boolean> disabledFilterLookup = Maps.newHashMap();
+	private static volatile Set<EmiIngredient> disabledStacks = Sets.newHashSet();
+	private static volatile List<IndexStackData.Filter> disabledFilters = Lists.newArrayList();
+	private static final ConcurrentHashMap<String, Boolean> disabledFilterLookup = new ConcurrentHashMap<>();
 	// Plugin defined
 	public static Set<EmiIngredient> pluginDisabledStacks = Sets.newHashSet();
 	public static List<Predicate<EmiStack>> pluginDisabledFilters = Lists.newArrayList();
@@ -40,15 +40,22 @@ public class EmiHidden {
 		pluginDisabledFilters.clear();
 	}
 
-	public static void reload() {
+	public static PrepareResult prepare() {
+		PrepareResult result = new PrepareResult(Sets.newHashSet(), Lists.newArrayList());
 		List<IndexStackData> isds = EmiData.stackData.stream().map(i -> i.get()).filter(i -> i.disable() && (!i.filters().isEmpty() || !i.removed().isEmpty())).toList();
 		for (IndexStackData data : isds) {
 			for (EmiIngredient stack : data.removed()) {
-				disabledStacks.add(stack);
-				disabledStacks.addAll(stack.getEmiStacks());
+				result.disabledStacks.add(stack);
+				result.disabledStacks.addAll(stack.getEmiStacks());
 			}
-			disabledFilters.addAll(data.filters());
+			result.disabledFilters.addAll(data.filters());
 		}
+		return result;
+	}
+
+	public static void apply(PrepareResult result) {
+		disabledStacks = result.disabledStacks;
+		disabledFilters = result.disabledFilters;
 	}
 
 	public static JsonArray save() {
@@ -73,7 +80,6 @@ public class EmiHidden {
 				hiddenStacks.add(stack);
 			}
 		}
-		EmiStackList.bakeFiltered();
 	}
 
 	public static boolean isHidden(EmiIngredient stack) {
@@ -133,4 +139,6 @@ public class EmiHidden {
 		EmiPersistentData.save();
 		EmiStackList.bakeFiltered();
 	}
+
+	public record PrepareResult(Set<EmiIngredient> disabledStacks, List<IndexStackData.Filter> disabledFilters) {}
 }

@@ -8,12 +8,12 @@ import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
 import dev.emi.emi.EmiPort;
-import dev.emi.emi.api.stack.Comparison;
 import dev.emi.emi.api.stack.EmiIngredient;
 import dev.emi.emi.api.stack.EmiRegistryAdapter;
 import dev.emi.emi.api.stack.EmiStack;
@@ -24,6 +24,7 @@ import dev.emi.emi.data.EmiData;
 import dev.emi.emi.data.IndexStackData;
 import dev.emi.emi.runtime.EmiHidden;
 import dev.emi.emi.runtime.EmiLog;
+import dev.emi.emi.runtime.EmiReloadManager;
 import it.unimi.dsi.fastutil.Hash;
 import it.unimi.dsi.fastutil.objects.Object2IntMap;
 import it.unimi.dsi.fastutil.objects.Object2IntOpenCustomHashMap;
@@ -33,7 +34,6 @@ import it.unimi.dsi.fastutil.objects.Reference2ReferenceOpenHashMap;
 import net.minecraft.block.Block;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.component.ComponentChanges;
-import net.minecraft.component.ComponentMap;
 import net.minecraft.fluid.FlowableFluid;
 import net.minecraft.fluid.Fluid;
 import net.minecraft.fluid.Fluids;
@@ -42,7 +42,6 @@ import net.minecraft.item.Item;
 import net.minecraft.item.ItemGroup;
 import net.minecraft.item.ItemGroups;
 import net.minecraft.item.ItemStack;
-import net.minecraft.nbt.NbtCompound;
 import net.minecraft.registry.tag.TagKey;
 
 public class EmiStackList {
@@ -51,8 +50,8 @@ public class EmiStackList {
 	private static final TagKey<Fluid> FLUID_HIDDEN = TagKey.of(EmiPort.getFluidRegistry().getKey(), EmiTags.HIDDEN_FROM_RECIPE_VIEWERS);
 	public static List<EmiAlias.Baked> registryAliases = Lists.newArrayList();
 	public static List<Predicate<EmiStack>> invalidators = Lists.newArrayList();
-	public static List<EmiStack> stacks = List.of();
-	public static List<EmiStack> filteredStacks = List.of();
+	public static volatile List<EmiStack> stacks = List.of();
+	public static volatile List<EmiStack> filteredStacks = List.of();
 	private static Object2IntMap<EmiStack> strictIndices = new Object2IntOpenCustomHashMap<>(new StrictHashStrategy());
 	private static Object2IntMap<Object> keyIndices = new Object2IntOpenHashMap<>();
 
@@ -64,11 +63,17 @@ public class EmiStackList {
 		keyIndices.clear();
 	}
 
-	public static void reload() {
+	public static void addStack(EmiStack stack) {
+		if (isHiddenFromRecipeViewers(stack.getKey())) return;
+		stacks.add(stack);
+	}
+
+	public static List<EmiStack> prepare() {
 		MinecraftClient client = MinecraftClient.getInstance();
 		ItemGroup.DisplayContext context = new ItemGroup.DisplayContext(client.player.networkHandler.getEnabledFeatures(), false, client.world.getRegistryManager());
 		List<IndexGroup> groups = Lists.newArrayList();
 		Map<String, IndexGroup> namespaceGroups = new LinkedHashMap<>();
+		EmiReloadManager.profileStep("stack_registry_prep");
 		for (Item item : EmiPort.getItemRegistry()) {
 			String itemName = "null";
 			try {
@@ -79,6 +84,7 @@ public class EmiStackList {
 				EmiLog.error("Item " + itemName + " threw while EMI was attempting to construct the index, items may be missing.", e);
 			}
 		}
+		EmiReloadManager.popStep("stack_registry_prep");
 		if (EmiConfig.indexSource != IndexSource.REGISTERED) {
 			// There is an unwritten convention that ItemGroup.updateEntries is only invoked on the main thread
 			long groupReloadStart = System.currentTimeMillis();
@@ -149,18 +155,24 @@ public class EmiStackList {
 		groups.add(fluidGroup);
 
 		Set<EmiStack> added = new ObjectOpenCustomHashSet<>(new StrictHashStrategy());
-		
-		stacks = Lists.newLinkedList();
+
+		List<EmiStack> newStacks = Lists.newLinkedList();
 		for (IndexGroup group : groups) {
 			if (group.shouldDisplay()) {
 				for (EmiStack stack : group.stacks) {
-					if (!added.contains(stack)) {
-						stacks.add(stack);
+					//add hidden check to keep the stacks out of the index right from the get-go
+					if (!added.contains(stack) && !isHiddenFromRecipeViewers(stack.getKey())) {
+						newStacks.add(stack);
 						added.add(stack);
 					}
 				}
 			}
 		}
+		return newStacks;
+	}
+
+	public static void apply(List<EmiStack> stacks) {
+		EmiStackList.stacks = stacks;
 	}
 
 	@SuppressWarnings({"deprecation", "unchecked"})
@@ -185,25 +197,26 @@ public class EmiStackList {
 	}
 
 	public static void bake() {
-		stacks.removeIf(s -> {
-			try {
-				if (s.isEmpty()) {
-					return true;
-				}
-				for (Predicate<EmiStack> invalidator : invalidators) {
-					if (invalidator.test(s)) {
+		List<EmiStack> bakingStacks = stacks
+				.parallelStream()
+				.filter((s) -> {
+					try {
+						if (s.isEmpty()) {
+							return false;
+						}
+						for (Predicate<EmiStack> invalidator : invalidators) {
+							if (invalidator.test(s)) {
+								return false;
+							}
+						}
 						return true;
+					} catch (Throwable t) {
+						EmiLog.error("Stack threw error while baking", t);
+						return false;
 					}
-				}
-				if (isHiddenFromRecipeViewers(s.getKey())) {
-					return true;
-				}
-				return false;
-			} catch (Throwable t) {
-				EmiLog.error("Stack threw error while baking", t);
-				return true;
-			}
-		});
+				})
+				.collect(Collectors.toCollection(Lists::newLinkedList));
+
 		for (Supplier<IndexStackData> supplier : EmiData.stackData) {
 			IndexStackData ssd = supplier.get();
 			if (!ssd.removed().isEmpty()) {
@@ -213,10 +226,10 @@ public class EmiStackList {
 						removed.add(stack.copy().comparison(c -> EmiPort.compareStrict()));
 					}
 				}
-				stacks.removeAll(removed);
+				bakingStacks.removeAll(removed);
 			}
 			if (!ssd.filters().isEmpty()) {
-				stacks.removeIf(s -> {
+				bakingStacks.removeIf(s -> {
 					String id = "" + s.getId();
 					for (IndexStackData.Filter filter : ssd.filters()) {
 						if (filter.filter().test(id)) {
@@ -231,23 +244,26 @@ public class EmiStackList {
 					continue;
 				}
 				if (added.after().isEmpty()) {
-					stacks.add(added.added().getEmiStacks().get(0));
-				} else {
-					int i = stacks.indexOf(added.after());
-					if (i == -1) {
-						i = stacks.size() - 1;
+					EmiStack stack = added.added().getEmiStacks().get(0);
+					if (!stack.isEmpty()) {
+						bakingStacks.add(stack);
 					}
-					stacks.add(i + 1, added.added().getEmiStacks().get(0));
+				} else {
+					EmiStack stack = added.added().getEmiStacks().get(0);
+					if (!stack.isEmpty()) {
+						int i = bakingStacks.indexOf(added.after());
+						if (i == -1) {
+							i = bakingStacks.size() - 1;
+						}
+						bakingStacks.add(i + 1, added.added().getEmiStacks().get(0));
+					}
 				}
 			}
 		}
-		stacks = stacks.stream().filter(stack -> {
+		stacks = bakingStacks.stream().filter(stack -> {
 			String name = "Unknown";
 			String id = "unknown";
 			try {
-				if (stack.isEmpty()) {
-					return false;
-				}
 				name = stack.toString();
 				id = stack.getId().toString();
 				if (name != null && stack.getKey() != null && stack.getName() != null) {
@@ -265,11 +281,10 @@ public class EmiStackList {
 			strictIndices.put(stack, i);
 			keyIndices.put(stack.getKey(), i);
 		}
-		bakeFiltered();
 	}
 
 	public static void bakeFiltered() {
-		filteredStacks = stacks.stream().filter(s -> !EmiHidden.isDisabled(s) && !EmiHidden.isHidden(s)).toList();
+		filteredStacks = stacks.stream().parallel().filter(s -> !(EmiHidden.isHidden(s) || EmiHidden.isDisabled(s))).collect(Collectors.toCollection(Lists::newArrayList));
 	}
 
 	public static int getIndex(EmiIngredient ingredient) {

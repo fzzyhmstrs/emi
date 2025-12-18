@@ -1,11 +1,15 @@
 package dev.emi.emi.search;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
@@ -21,6 +25,7 @@ import dev.emi.emi.data.EmiData;
 import dev.emi.emi.registry.EmiStackList;
 import dev.emi.emi.runtime.EmiLog;
 import dev.emi.emi.runtime.EmiReloadLog;
+import dev.emi.emi.runtime.EmiReloadManager;
 import dev.emi.emi.screen.EmiScreenManager;
 import net.minecraft.client.resource.language.I18n;
 import net.minecraft.client.search.SuffixArray;
@@ -32,6 +37,8 @@ import net.minecraft.item.Items;
 import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
+
+import javax.naming.directory.SearchResult;
 
 public class EmiSearch {
 	public static final Pattern TOKENS = Pattern.compile(
@@ -51,11 +58,11 @@ public class EmiSearch {
 	public static volatile Thread searchThread = null;
 	public static volatile List<? extends EmiIngredient> stacks = EmiStackList.stacks;
 	public static volatile CompiledQuery compiledQuery;
-	public static Set<EmiStack> bakedStacks;
-	public static SuffixArray<SearchStack> names, tooltips, mods;
-	public static SuffixArray<EmiStack> aliases;
+	public static volatile Set<EmiStack> bakedStacks;
+	public static volatile SuffixArray<SearchStack> names, tooltips, mods;
+	public static volatile SuffixArray<EmiStack> aliases;
 
-	public static void bake() {
+	public static void bake(Executor executor) {
 		SuffixArray<SearchStack> names = new SuffixArray<>();
 		SuffixArray<SearchStack> tooltips = new SuffixArray<>();
 		SuffixArray<SearchStack> mods = new SuffixArray<>();
@@ -63,69 +70,104 @@ public class EmiSearch {
 		Set<EmiStack> bakedStacks = Sets.newIdentityHashSet();
 		boolean old = EmiConfig.appendItemModId;
 		EmiConfig.appendItemModId = false;
-		for (EmiStack stack : EmiStackList.stacks) {
-			try {
-				SearchStack searchStack = new SearchStack(stack);
-				bakedStacks.add(stack);
-				Text name = NameQuery.getText(stack);
-				if (name != null) {
-					names.add(searchStack, name.getString().toLowerCase());
+
+		EmiReloadManager.profileStep("baking_stack_arrays", () -> {
+			EmiReloadManager.profileStep("creating_search_results");
+			List<SearchBakeResult> bakeResult = EmiStackList.stacks
+					.parallelStream()
+					.map((stack) -> {
+						SearchStack ss = new SearchStack(stack);
+						Text name = NameQuery.getText(stack);
+						String nameString = name == null ? null : name.getString().toLowerCase();
+						List<Text> tooltip = stack.getTooltipText();
+						List<String> tooltipString = tooltip == null ? null : tooltip.stream().map((text) -> text.getString().toLowerCase()).toList();
+						Identifier id = stack.getId();
+						return new SearchBakeResult(ss, nameString, tooltipString, id);
+					})
+					.collect(Collectors.toCollection(() -> new ArrayList<>(EmiStackList.stacks.size())));
+			EmiReloadManager.popStep("creating_search_results");
+
+			EmiReloadManager.profileStep("processing_search_bake", () -> {
+				for (SearchBakeResult searchBakeResult : bakeResult) {
+					try {
+						SearchStack searchStack = searchBakeResult.stack;
+						bakedStacks.add(searchStack.stack);
+						if (searchBakeResult.nameString != null) {
+							names.add(searchStack, searchBakeResult.nameString);
+						}
+						if (searchBakeResult.tooltip != null) {
+							for (int i = 1; i < searchBakeResult.tooltip.size(); i++) {
+								String text = searchBakeResult.tooltip.get(i);
+								if (text != null) {
+									tooltips.add(searchStack, text);
+								}
+							}
+						}
+						Identifier id = searchBakeResult.id;
+						if (id != null) {
+							mods.add(searchStack, EmiUtil.getModName(id.getNamespace()).toLowerCase());
+							mods.add(searchStack, id.getNamespace().toLowerCase());
+							names.add(searchStack, id.getPath().toLowerCase());
+						}
+						if (searchBakeResult.stack.stack.getItemStack().getItem() == Items.ENCHANTED_BOOK) {
+							for (RegistryEntry<Enchantment> e : searchBakeResult.stack.stack.getOrDefault(DataComponentTypes.ENCHANTMENTS, ItemEnchantmentsComponent.DEFAULT).getEnchantments()) {
+								Identifier eid = EmiPort.getEnchantmentRegistry().getId(e.value());
+								if (eid != null && !eid.getNamespace().equals("minecraft")) {
+									mods.add(searchStack, EmiUtil.getModName(eid.getNamespace()).toLowerCase());
+								}
+							}
+						}
+					} catch (Exception e) {
+						EmiLog.error("EMI caught an exception while baking search for " + searchBakeResult, e);
+					}
 				}
-				List<Text> tooltip = stack.getTooltipText();
-				if (tooltip != null) {
-					for (int i = 1; i < tooltip.size(); i++) {
-						Text text = tooltip.get(i);
-						if (text != null) {
-							tooltips.add(searchStack, text.getString().toLowerCase());
+			});
+		});
+
+		EmiReloadManager.profileStep("baking_alias_array", () -> {
+			for (Supplier<EmiAlias> supplier : Lists.newArrayList(EmiData.aliases)) {
+				EmiAlias alias = supplier.get();
+				for (String key : alias.keys()) {
+					if (!I18n.hasTranslation(key)) {
+						EmiReloadLog.warn("Untranslated alias " + key);
+					}
+					String text = I18n.translate(key).toLowerCase();
+					for (EmiIngredient ing : alias.stacks()) {
+						for (EmiStack stack : ing.getEmiStacks()) {
+							aliases.add(stack.copy().comparison(EmiPort.compareStrict()), text);
 						}
 					}
 				}
-				Identifier id = stack.getId();
-				if (id != null) {
-					mods.add(searchStack, EmiUtil.getModName(id.getNamespace()).toLowerCase());
-					mods.add(searchStack, id.getNamespace().toLowerCase());
-					names.add(searchStack, id.getPath().toLowerCase());
-				}
-				if (stack.getItemStack().getItem() == Items.ENCHANTED_BOOK) {
-					for (RegistryEntry<Enchantment> e : stack.getOrDefault(DataComponentTypes.ENCHANTMENTS, ItemEnchantmentsComponent.DEFAULT).getEnchantments()) {
-						Identifier eid = EmiPort.getEnchantmentRegistry().getId(e.value());
-						if (eid != null && !eid.getNamespace().equals("minecraft")) {
-							mods.add(searchStack, EmiUtil.getModName(eid.getNamespace()).toLowerCase());
+			}
+			for (EmiAlias.Baked alias : Lists.newArrayList(EmiStackList.registryAliases)) {
+				for (Text text : alias.text()) {
+					for (EmiIngredient ing : alias.stacks()) {
+						for (EmiStack stack : ing.getEmiStacks()) {
+							aliases.add(stack.copy().comparison(EmiPort.compareStrict()), text.getString().toLowerCase());
 						}
 					}
 				}
-			} catch (Exception e) {
-				EmiLog.error("EMI caught an exception while baking search for " + stack, e);
 			}
-		}
-		for (Supplier<EmiAlias> supplier : EmiData.aliases) {
-			EmiAlias alias = supplier.get();
-			for (String key : alias.keys()) {
-				if (!I18n.hasTranslation(key)) {
-					EmiReloadLog.warn("Untranslated alias " + key);
-				}
-				String text = I18n.translate(key).toLowerCase();
-				for (EmiIngredient ing : alias.stacks()) {
-					for (EmiStack stack : ing.getEmiStacks()) {
-						aliases.add(stack.copy().comparison(EmiPort.compareStrict()), text);
-					}
-				}
-			}
-		}
-		for (EmiAlias.Baked alias : EmiStackList.registryAliases) {
-			for (Text text : alias.text()) {
-				for (EmiIngredient ing : alias.stacks()) {
-					for (EmiStack stack : ing.getEmiStacks()) {
-						aliases.add(stack.copy().comparison(EmiPort.compareStrict()), text.getString().toLowerCase());
-					}
-				}
-			}
-		}
+		});
+
 		EmiConfig.appendItemModId = old;
-		names.build();
-		tooltips.build();
-		mods.build();
-		aliases.build();
+
+		EmiReloadManager.profileStep("build_arrays", () -> {
+			CompletableFuture.allOf(
+				CompletableFuture.runAsync(() -> {
+					EmiReloadManager.profileStep("build_name_array", names::build);
+				}, executor),
+				CompletableFuture.runAsync(() -> {
+					EmiReloadManager.profileStep("build_tooltip_array", tooltips::build);
+				}, executor),
+				CompletableFuture.runAsync(() -> {
+					EmiReloadManager.profileStep("build_mods_array", mods::build);
+				}, executor),
+				CompletableFuture.runAsync(() -> {
+					EmiReloadManager.profileStep("build_alias_array", aliases::build);
+				}, executor)
+			).join();
+		});
 		EmiSearch.names = names;
 		EmiSearch.tooltips = tooltips;
 		EmiSearch.mods = mods;
@@ -141,8 +183,9 @@ public class EmiSearch {
 		synchronized (EmiSearch.class) {
 			SearchWorker worker = new SearchWorker(query, EmiScreenManager.getSearchSource());
 			currentWorker = worker;
-			
+
 			searchThread = new Thread(worker);
+			searchThread.setName("EMI Search Worker");
 			searchThread.setDaemon(true);
 			searchThread.start();
 		}
@@ -294,4 +337,6 @@ public class EmiSearch {
 			}
 		}
 	}
+
+	private record SearchBakeResult(SearchStack stack, String nameString, List<String> tooltip, Identifier id) {}
 }

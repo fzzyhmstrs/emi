@@ -43,10 +43,10 @@ public class EmiTags {
 	public static final Identifier HIDDEN_FROM_RECIPE_VIEWERS = EmiPort.id("c", "hidden_from_recipe_viewers");
 	private static final Map<TagKey<?>, Identifier> MODELED_TAGS = Maps.newHashMap();
 	private static final Map<Set<?>, List<TagKey<?>>> CACHED_TAGS = Maps.newHashMap();
-	private static final Map<TagKey<?>, List<?>> TAG_CONTENTS = Maps.newHashMap();
-	private static final Map<TagKey<?>, List<?>> TAG_VALUES = Maps.newHashMap();
-	private static final Map<Identifier, List<TagKey<?>>> SORTED_TAGS = Maps.newHashMap();
-	public static final List<TagKey<?>> TAGS = Lists.newArrayList();
+	private static volatile Map<TagKey<?>, List<?>> TAG_CONTENTS = Maps.newHashMap();
+	private static volatile Map<TagKey<?>, List<?>> TAG_VALUES = Maps.newHashMap();
+	private static volatile Map<Identifier, List<TagKey<?>>> SORTED_TAGS = Maps.newHashMap();
+	public static volatile List<TagKey<?>> TAGS = Lists.newArrayList();
 	public static TagExclusions exclusions = new TagExclusions();
 
 	public static <T> Registry<T> getRegistry(TagKey<T> key) {
@@ -240,20 +240,30 @@ public class EmiTags {
 		}
 		*/
 	}
-	
-	public static void reload() {
-		TAGS.clear();
-		SORTED_TAGS.clear();
-		TAG_CONTENTS.clear();
-		TAG_VALUES.clear();
-		CACHED_TAGS.clear();
+
+	public static PrepareResult prepare() {
+		// why aren't these cleared with a clear() method at the beginning of reload?
+		TAGS.clear();         //
+		SORTED_TAGS.clear();  //
+		TAG_CONTENTS.clear(); //
+		TAG_VALUES.clear();   //
+		CACHED_TAGS.clear();  //
+		PrepareResult result = new PrepareResult(Maps.newHashMap(), Maps.newHashMap(), Maps.newHashMap(), Lists.newArrayList());
 		for (Registry<?> registry : ADAPTERS_BY_REGISTRY.keySet()) {
-			reloadTags(registry);
+			reloadTags(registry, result);
 		}
+		return result;
+	}
+
+	public static void apply(PrepareResult result) {
+		TAGS = result.TAGS;
+		SORTED_TAGS = result.SORTED_TAGS;
+		TAG_CONTENTS = result.TAG_CONTENTS;
+		TAG_VALUES = result.TAG_VALUES;
 	}
 
 	@SuppressWarnings({"unchecked", "rawtypes"})
-	private static <T> void reloadTags(Registry<T> registry) {
+	private static <T> void reloadTags(Registry<T> registry, PrepareResult result) {
 		Set<T> hidden = EmiUtil.values(TagKey.of(registry.getKey(), HIDDEN_FROM_RECIPE_VIEWERS)).map(RegistryEntry::value).collect(Collectors.toSet());
 		Identifier rid = registry.getKey().getValue();
 		List<TagKey<T>> tags = registry.streamTags()
@@ -263,19 +273,19 @@ public class EmiTags {
 		tags = consolodateTags(tags);
 		for (TagKey<T> key : tags) {
 			List<T> contents = EmiUtil.values(key).map(i -> i.value()).toList();
-			TAG_CONTENTS.put(key, contents);
+			result.TAG_CONTENTS.put(key, contents);
 			List<T> values = contents.stream().filter(s -> !EmiHidden.isDisabled(stackFromKey(key, s))).toList();
 			if (values.isEmpty()) {
-				TAG_VALUES.put(key, contents);
+				result.TAG_VALUES.put(key, contents);
 			} else {
-				TAG_VALUES.put(key, values);
+				result.TAG_VALUES.put(key, values);
 			}
 		}
-		EmiTags.TAGS.addAll(tags.stream().sorted((a, b) -> a.toString().compareTo(b.toString())).toList());
+		result.TAGS.addAll(tags.stream().sorted((a, b) -> a.toString().compareTo(b.toString())).toList());
 		tags = tags.stream()
 			.sorted((a, b) -> Long.compare(EmiUtil.values(b).count(), EmiUtil.values(a).count()))
 			.toList();
-		EmiTags.SORTED_TAGS.put(registry.getKey().getValue(), (List) tags);
+		result.SORTED_TAGS.put(registry.getKey().getValue(), (List) tags);
 	}
 
 	@SuppressWarnings("unchecked")
@@ -349,4 +359,9 @@ public class EmiTags {
 		}
 		return a.id().toString().length() <= b.id().toString().length() ? a : b;
 	}
+
+	public record PrepareResult(Map<TagKey<?>, List<?>> TAG_CONTENTS,
+	Map<TagKey<?>, List<?>> TAG_VALUES,
+	Map<Identifier, List<TagKey<?>>> SORTED_TAGS,
+	List<TagKey<?>> TAGS) {}
 }

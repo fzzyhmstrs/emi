@@ -58,7 +58,7 @@ public class EmiRecipes {
 	public static List<EmiRecipeDecorator> decorators = Lists.newArrayList();
 
 	public static Map<Recipe<?>, Identifier> recipeIds = Map.of();
-	
+
 	public static void clear() {
 		setWorker(null);
 		lateRecipes.clear();
@@ -84,11 +84,21 @@ public class EmiRecipes {
 	public static void bake() {
 		long start = System.currentTimeMillis();
 		recipes.addAll(EmiData.recipes.stream().map(r -> r.get()).toList());
-		categories.sort((a, b) -> EmiRecipeCategoryProperties.getOrder(a) - EmiRecipeCategoryProperties.getOrder(b));
+		categories.sort(Comparator.comparingInt(EmiRecipeCategoryProperties::getOrder));
 		invalidators.addAll(EmiData.recipeFilters);
 
 		invalidators.add(r -> {
-			for (EmiIngredient i : Iterables.concat(r.getInputs(), r.getOutputs(), r.getCatalysts())) {
+			for (EmiIngredient i : r.getInputs()) {
+				if (EmiHidden.isDisabled(i)) {
+					return true;
+				}
+			}
+			for (EmiIngredient i : r.getOutputs()) {
+				if (EmiHidden.isDisabled(i)) {
+					return true;
+				}
+			}
+			for (EmiIngredient i : r.getCatalysts()) {
 				if (EmiHidden.isDisabled(i)) {
 					return true;
 				}
@@ -96,7 +106,7 @@ public class EmiRecipes {
 			return false;
 		});
 
-		List<EmiRecipe> filtered = recipes.stream().filter(r -> {
+		List<EmiRecipe> filtered = recipes.parallelStream().filter(r -> {
 			for (Predicate<EmiRecipe> predicate : invalidators) {
 				if (predicate.test(r)) {
 					return false;
@@ -131,7 +141,9 @@ public class EmiRecipes {
 	private static synchronized void setWorker(Worker worker) {
 		activeWorker = worker;
 		if (worker != null) {
-			new Thread(activeWorker).start();
+			Thread thread = new Thread(activeWorker);
+			thread.setName("EMI Recipe Worker");
+			thread.start();
 		}
 	}
 
@@ -155,7 +167,7 @@ public class EmiRecipes {
 			this.categories = categories.stream().distinct().toList();
 			this.workstations = workstations;
 			this.recipes = List.copyOf(recipes);
-	
+
 			Object2IntMap<Identifier> duplicateIds = new Object2IntOpenHashMap<>();
 			Set<Identifier> incorrectIds = new ObjectArraySet<>();
 			for (EmiRecipe recipe : recipes) {
@@ -186,7 +198,7 @@ public class EmiRecipes {
 					}
 				}
 			}
-	
+
 			if (EmiConfig.devMode) {
 				for (Identifier id : duplicateIds.keySet()) {
 					EmiReloadLog.warn(duplicateIds.getInt(id) + " recipes loaded with the same id: " + id);
@@ -195,7 +207,7 @@ public class EmiRecipes {
 					EmiReloadLog.warn("Recipe " + id + " not present in recipe manager. Consider prefixing its path with '/' if it is synthetic.");
 				}
 			}
-	
+
 			Map<EmiStack, Set<EmiRecipe>> byInput = new Object2ObjectOpenCustomHashMap<>(new EmiStackList.ComparisonHashStrategy());
 			Map<EmiStack, Set<EmiRecipe>> byOutput = new Object2ObjectOpenCustomHashMap<>(new EmiStackList.ComparisonHashStrategy());
 
