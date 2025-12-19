@@ -279,6 +279,7 @@ public class JemiPlugin implements IModPlugin, EmiPlugin {
 
 	private void addInfoRecipes(EmiRegistry registry, IRecipeCategory<IJeiIngredientInfoRecipe> category) {
 		List<IJeiIngredientInfoRecipe> recipes = runtime.getRecipeManager().createRecipeLookup(RecipeTypes.INFORMATION).includeHidden().get().toList();
+		EmiLog.LOG.info("JEI had {} info recipes", recipes.size());
 		Map<List<EmiStack>, List<IJeiIngredientInfoRecipe>> grouped = Maps.newHashMap();
 		for (IJeiIngredientInfoRecipe recipe : recipes) {
 			grouped.computeIfAbsent(recipe.getIngredients().stream().map(JemiUtil::getStack).toList(), k -> Lists.newArrayList()).add(recipe);
