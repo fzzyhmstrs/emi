@@ -81,9 +81,9 @@ public class RecipeDefaults {
 		return map;
 	}
 
-	public static record Resolution(Identifier recipe, List<JsonElement> stacks) {
+	private record Resolution(Identifier recipe, List<JsonElement> stacks) {
 	}
 
-	public static record Tag(JsonElement tag, JsonElement stack) {
+	private record Tag(JsonElement tag, JsonElement stack) {
 	}
 }

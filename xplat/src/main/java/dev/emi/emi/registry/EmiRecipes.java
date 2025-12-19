@@ -106,11 +106,15 @@ public class EmiRecipes {
 			return false;
 		});
 
-		List<EmiRecipe> filtered = recipes.parallelStream().filter(r -> {
-			for (Predicate<EmiRecipe> predicate : invalidators) {
-				if (predicate.test(r)) {
-					return false;
+		List<EmiRecipe> filtered = recipes.stream().filter(r -> {
+			try {
+				for (Predicate<EmiRecipe> predicate : invalidators) {
+					if (predicate.test(r)) {
+						return false;
+					}
 				}
+			} catch (Throwable e) {
+				EmiReloadLog.warn("Exception filtering recipe " + r.getId(), e);
 			}
 			return true;
 		}).toList();
@@ -170,10 +174,13 @@ public class EmiRecipes {
 
 			Object2IntMap<Identifier> duplicateIds = new Object2IntOpenHashMap<>();
 			Set<Identifier> incorrectIds = new ObjectArraySet<>();
-			for (EmiRecipe recipe : recipes) {
+			var blah = categories.stream().map((c) -> c + " " + c.id).toList().toString();
+			for (EmiRecipe recipe : this.recipes) {
 				Identifier id = recipe.getId();
 				EmiRecipeCategory category = recipe.getCategory();
 				if (!categories.contains(category)) {
+					EmiLog.error(category + " " + category.id);
+					EmiLog.error(blah);
 					EmiReloadLog.warn("Recipe " + id + " loaded with unregistered category: " + category.getId());
 				}
 				if (EmiConfig.logNonTagIngredients && recipe.supportsRecipeTree()) {

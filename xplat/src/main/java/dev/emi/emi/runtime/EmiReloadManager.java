@@ -13,6 +13,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
@@ -20,10 +21,12 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 import com.google.common.collect.Lists;
 
 import dev.emi.emi.EmiPort;
+import dev.emi.emi.api.EmiPlugin;
 import dev.emi.emi.api.recipe.EmiRecipe;
 import dev.emi.emi.bom.BoM;
 import dev.emi.emi.jemi.JemiPlugin;
@@ -52,7 +55,7 @@ public class EmiReloadManager {
 	// 0 - empty, 1 - reloading, 2 - loaded, -1 - error
 	private static volatile int status = 0;
 	private static Thread thread;
-	private static final Executor executor = Executors.newFixedThreadPool(ForkJoinPool.getCommonPoolParallelism(), Thread.ofPlatform().daemon().name("EMI Reload Worker-", 1).factory());
+	private static final ExecutorService executor = Executors.newFixedThreadPool(ForkJoinPool.getCommonPoolParallelism(), Thread.ofPlatform().daemon().name("EMI Reload Worker-", 1).factory());
 
 	private static volatile Text reloadStep = EmiPort.literal("");
 	private static final Profile reloadProfile = new Profile();
@@ -91,7 +94,7 @@ public class EmiReloadManager {
 			if (thread != null && thread.isAlive()) {
 				restart = true;
 			} else {
-				thread = new Thread(new ReloadWorker());
+				thread = new Thread(new ReloadWorker(false));
 				thread.setName("EMI Reload Worker");
 				thread.setDaemon(true);
 				thread.start();
@@ -102,18 +105,18 @@ public class EmiReloadManager {
 	public static void reload() {
 		synchronized (EmiReloadManager.class) {
 			reloadProfile.reset();
-			pushStep(EmiPort.literal("Starting Reload"), "start_reload");
-			status = 1;
-			if (thread != null && thread.isAlive()) {
-				restart = true;
-			} else {
-				clear = false;
-				thread = new Thread(new ReloadWorker());
-				thread.setName("EMI Reload Worker");
-				thread.setDaemon(false);
-				thread.start();
-			}
-			popStep("start_reload");
+			runStep(EmiPort.literal("Starting Reload"), "start_reload", () -> {
+				status = 1;
+				if (thread != null && thread.isAlive()) {
+					restart = true;
+				} else {
+					clear = false;
+					thread = new Thread(new ReloadWorker(true));
+					thread.setName("EMI Reload Worker");
+					thread.setDaemon(false);
+					thread.start();
+				}
+			});
 		}
 	}
 
@@ -149,7 +152,7 @@ public class EmiReloadManager {
 
 
 	public static void popStep(String key) {
-		EmiLog.LOG.debug("Reload step {} completed in {}ms", key, System.currentTimeMillis() - reloadStarts.get(key));
+		EmiLog.LOG.debug("Reload step {} completed in {}ms", key, System.currentTimeMillis() - reloadStarts.getOrDefault(key, 0L));
 		reloadProfile.popProfile(key);
 		reloadStarts.remove(key);
 		reloadWorries.remove(key);
@@ -167,6 +170,13 @@ public class EmiReloadManager {
 		popStep(key);
 	}
 
+	public static <T>  T supplyStep(Text text, String key, long worry, Supplier<T> supplier) {
+		pushStep(text, key, worry);
+		T t = supplier.get();
+		popStep(key);
+		return t;
+	}
+
 	public static void profileStep(String key, Runnable runnable) {
 		reloadProfile.pushProfile(key);
 		reloadStarts.put(key, System.currentTimeMillis());
@@ -179,6 +189,14 @@ public class EmiReloadManager {
 		reloadStarts.put(key, System.currentTimeMillis());
 	}
 
+	public static void step(Text text) {
+		step(text, 5_000);
+	}
+
+	public static void step(Text text, long worry) {
+		EmiLog.info(text.getString());
+	}
+
 	public static boolean isLoaded() {
 		return status == 2 && (thread == null || !thread.isAlive());
 	}
@@ -187,11 +205,30 @@ public class EmiReloadManager {
 		return status;
 	}
 
-	private static class ReloadWorker implements Runnable {
+	private record ReloadWorker(boolean profile) implements Runnable {
 
 		@Override
 			public void run() {
+				AtomicBoolean flag = new AtomicBoolean(false);
+				if (profile) {
+					CompletableFuture.runAsync(() -> {
+						while (!flag.get()) {
+							try {
+								reloadProfile.poll();
+								Thread.sleep(Duration.ofNanos(50_000));
+							} catch (Throwable ignored) {
+							}
+						}
+					});
+				}
 				runReload(3);
+				flag.set(true);
+			}
+
+			private void testRestart(int retries) {
+				if (restart) {
+					runReload(retries);
+				}
 			}
 
 			private void runReload(int retries) {
@@ -203,20 +240,7 @@ public class EmiReloadManager {
 						long reloadStart = System.currentTimeMillis();
 						restart = false;
 
-						AtomicBoolean flag = new AtomicBoolean(false);
-
-						CompletableFuture.runAsync(() -> {
-							while (!flag.get()) {
-								try {
-									reloadProfile.poll();
-									Thread.sleep(Duration.ofNanos(50_000));
-								} catch (Throwable ignored) {
-								}
-							}
-						});
-
 						runStep(EmiPort.literal("Clearing data"), "clear_data", () -> {
-							pushStep(EmiPort.literal("Clearing data"), "clear_data");
 							EmiRecipes.clear();
 							EmiStackList.clear();
 							EmiIngredientSerializers.clear();
@@ -227,7 +251,6 @@ public class EmiReloadManager {
 							EmiHidden.clear();
 							EmiTags.ADAPTERS_BY_CLASS.map().clear();
 							EmiTags.ADAPTERS_BY_REGISTRY.clear();
-
 						});
 						if (clear) {
 							clear = false;
@@ -242,64 +265,46 @@ public class EmiReloadManager {
 							EmiReloadLog.warn("Recipe Manager is null");
 							break;
 						}
-						List<EmiPluginContainer> plugins = Lists.newArrayList();
-						profileStep("sort_plugin", () -> {
-							plugins.addAll(EmiAgnos.getPlugins().stream()
-									.sorted(Comparator.comparingInt(ReloadWorker::entrypointPriority)).toList());
 
+						List<EmiPluginContainer> plugins = Lists.newArrayList();
+						List<EmiPluginContainer> lastPlugins = Lists.newArrayList();
+
+						profileStep("sort_plugin", () -> {
+							List<EmiPluginContainer> foundPlugins = EmiAgnos.getPlugins();
+							for (EmiPluginContainer plugin : foundPlugins) {
+								if (entrypointPriority(plugin) == 0) {
+									plugins.add(plugin);
+								}
+							}
+							for (EmiPluginContainer plugin : foundPlugins) {
+								if (entrypointPriority(plugin) != 0) {
+									plugins.add(plugin);
+								}
+							}
 							if (EmiAgnos.isModLoaded("jei")) {
-								plugins.add(new EmiPluginContainer(new JemiPlugin(), "jemi"));
+								lastPlugins.add(new EmiPluginContainer(new JemiPlugin(), "jemi"));
 							}
 						});
+						testRestart(retries);
 
-						int finalRetries = retries;
-						List<CompletableFuture<InitContext>> initFutures = Lists.newArrayList();
-						List<CompletableFuture<InitContext>> whenCompleteInitFutures = Lists.newArrayList();
-
-						for (EmiPluginContainer container : plugins) {
-							EmiInitRegistryAsyncImpl initRegistry = new EmiInitRegistryAsyncImpl();
-							CompletableFuture<InitContext> future = CompletableFuture.supplyAsync(() -> {
-								long start = System.currentTimeMillis();
-								try {
-									pushStep(EmiPort.literal("Initializing plugin from " + container.id()), container.id() + "_init", 5_000);
-									container.plugin().initialize(initRegistry);
-									EmiLog.info("Initialized plugin from " + container.id() + " in " + (System.currentTimeMillis() - start) + "ms");
-								} catch (Throwable e) {
-									EmiReloadLog.warn("Exception initializing plugin provided by " + container.id(), e);
-									if (restart) {
-										runReload(finalRetries);
-									}
-									return new InitContext(Optional.empty(), container.id());
-								}
-								return new InitContext(Optional.of(initRegistry), container.id());
-
-							}, executor).orTimeout(15_000, TimeUnit.MILLISECONDS);
-							initFutures.add(future);
-							whenCompleteInitFutures.add(future.whenComplete((result, exception) -> {
-								popStep(container.id() + "_init");
-								if (exception instanceof TimeoutException) {
-									EmiReloadLog.warn("Plugin provided by " + container.id() + " timed out while registering. Registration of EMI may be incomplete.");
-								} else if (!(exception instanceof CancellationException) && result != null) {
-									if (result.initRegistry.isEmpty() && restart) {
-										//don't know if I really need to do this, but it will save CPU cycles so yay
-										for (CompletableFuture<InitContext> future2 : initFutures) {
-											future2.cancel(true);
-										}
-										runReload(finalRetries);
-									}
-								}
-							}));
-						}
-
+						//collect and start plugin workers
+						List<CompletableFuture<InitContext>> whenCompleteInitFutures = plugins.stream().map(this::initializePlugin).toList();
 						//wait in the worker thread for the initialization to complete
 						CompletableFuture.allOf(whenCompleteInitFutures.toArray(CompletableFuture[]::new)).join();
+						testRestart(retries);
 
 						//collect initializations
 						profileStep("collect_init", () -> {
-							for (CompletableFuture<InitContext> initFuture : initFutures) {
+							for (CompletableFuture<InitContext> initFuture : whenCompleteInitFutures) {
 								initFuture.join().initRegistry.ifPresent(EmiInitRegistryAsyncImpl::collectInit);
 							}
 						});
+
+						for (EmiPluginContainer container : lastPlugins) {
+							initializePlugin(container).join().initRegistry().ifPresent(EmiInitRegistryAsyncImpl::collectInit);
+						}
+
+						EmiComparisonDefaults.comparisons = new HashMap<>();
 
 						CompletableFuture<Void> filtersFuture = CompletableFuture.supplyAsync(() -> {
 							pushStep(EmiPort.literal("Processing filters"), "process_filters");
@@ -319,72 +324,37 @@ public class EmiReloadManager {
 
 						CompletableFuture<Void> indexFuture = CompletableFuture.supplyAsync(() -> {
 							pushStep(EmiPort.literal("Constructing index"), "construct_index");
-							EmiComparisonDefaults.comparisons = new HashMap<>();
 							return EmiStackList.prepare();
 						}, executor).thenAccept((result) -> {
-							if (restart) {
-								runReload(finalRetries);
-							}
 							EmiStackList.apply(result);
 							popStep("construct_index");
 						});
 
 						CompletableFuture<Void> miscFuture = CompletableFuture.runAsync(() -> {
-							pushStep(EmiPort.literal("Loading persistent data"), "load_data", 15_000);
-							BoM.reload();
-							EmiPersistentData.load();
+							runStep(EmiPort.literal("Loading persistent data"), "load_data", 15_000, EmiPersistentData::load);
 						}, executor).orTimeout(60_000, TimeUnit.MILLISECONDS).whenComplete((result, exception) -> {
 							if (exception instanceof TimeoutException) {
 								EmiReloadLog.warn("EMI reload timed out while loading persistent data. EMI reload may be incomplete.");
 							}
-							popStep("load_data");
 						});
 
 						//wait for filters, tags, and the index
 						//the persistent data can run past here though
 						CompletableFuture.allOf(filtersFuture, tagsFuture).join();
+						testRestart(retries);
 
 						//build plugins with separate futures by plugin
-						List<CompletableFuture<RegisterContext>> registerFutures = Lists.newArrayList();
-						List<CompletableFuture<RegisterContext>> whenCompleteRegisterFutures = Lists.newArrayList();
-						int order = 0;
-
-						for (EmiPluginContainer container : plugins) {
-							final int currentOrder = ++order;
-							CompletableFuture<RegisterContext> future = CompletableFuture.supplyAsync(() -> {
-								pushStep(EmiPort.literal("Loading plugin from " + container.id()), container.id() + "_register", 10_000);
-								EmiRegistryPluginAsyncImpl registry = new EmiRegistryPluginAsyncImpl(container.id(), currentOrder);
-								long start = System.currentTimeMillis();
-								try {
-									container.plugin().register(registry);
-								} catch (Throwable e) {
-									EmiReloadLog.warn("Exception initializing plugin provided by " + container.id(), e);
-									return new RegisterContext(Optional.empty(), container);
-								}
-								EmiLog.info("Initialized plugin from " + container.id() + " in " + (System.currentTimeMillis() - start) + "ms");
-								return new RegisterContext(Optional.of(registry), container);
-							}, executor).orTimeout(90, TimeUnit.SECONDS);
-							registerFutures.add(future);
-							whenCompleteRegisterFutures.add(future.whenComplete((result, exception) -> {
-								popStep(container.id() + "_register");
-								if (exception instanceof TimeoutException) {
-									EmiReloadLog.warn("Plugin provided by " + container.id() + " timed out while registering. Registration of EMI may be incomplete.");
-								} else if (!(exception instanceof CancellationException) && result != null) {
-									if (result.registry.isEmpty() && restart) {
-										//don't know if I really need to do this, but it will save CPU cycles so yay
-										for (CompletableFuture<RegisterContext> future2 : registerFutures) {
-											future2.cancel(true);
-										}
-										runReload(finalRetries);
-									}
-								}
-							}));
-						}
+						List<CompletableFuture<RegisterContext>> whenCompleteRegisterFutures = plugins.stream().map(this::registerPlugin).toList();
 
 						//wait for initialization to complete
 						CompletableFuture.allOf(whenCompleteRegisterFutures.toArray(CompletableFuture[]::new)).join();
+						testRestart(retries);
+
 						//make sure the stack list is built
 						indexFuture.join();
+						testRestart(retries);
+						miscFuture.join();
+						testRestart(retries);
 
 						//apply all initialized plugins to the needed places
 						profileStep("collect_registration", () -> {
@@ -393,14 +363,18 @@ public class EmiReloadManager {
 							}
 						});
 
-						if (restart) {
-							runReload(retries);
+						//plugins to run after "native" plugins are registered (JEI)
+						for (EmiPluginContainer container : lastPlugins) {
+							registerPlugin(container).join().registry().ifPresent(EmiRegistryPluginAsyncImpl::collectRegistry);
+							testRestart(retries);
 						}
+
 
 						CompletableFuture<Void> bakeIndexFuture = CompletableFuture.runAsync(() -> {
 							runStep(EmiPort.literal("Baking index"), "bake_index", EmiStackList::bake);
 						}, executor);
 
+						int finalRetries = retries;
 						CompletableFuture<Void> recipesFuture = CompletableFuture.runAsync(() -> {
 							runStep(EmiPort.literal("Registering late recipes"), "register_late", 10_000, () -> {
 								Consumer<EmiRecipe> registerLateRecipe = (recipe) -> {
@@ -417,34 +391,38 @@ public class EmiReloadManager {
 										consumer.accept(registerLateRecipe);
 									} catch (Exception e) {
 										EmiReloadLog.warn("Exception loading late recipes for plugins:", e);
-										if (restart) {
-											runReload(finalRetries);
-										}
+
 									}
 								}
 							});
+							testRestart(finalRetries);
 							pushStep(EmiPort.literal("Baking recipes"), "baking_recipes", 15_000);
 							EmiRecipes.bake();
 						}, executor).orTimeout(60_000, TimeUnit.MILLISECONDS).whenComplete((result, exception) -> {
-							if (exception instanceof TimeoutException) {
-								EmiReloadLog.warn("EMI reload timed out while baking recipes. EMI searching may be not work correctly.");
-							}
 							popStep("baking_recipes");
+							//reload the BoM after recipes are baked
+							runStep(EmiPort.literal("Reloading BoM"), "reload_bom", BoM::reload);
+							if (exception instanceof TimeoutException) {
+								EmiReloadLog.warn("EMI reload timed out while baking recipes. EMI recipes may be not work correctly.");
+							}
 						});
 
+						//wait for index bake and then misc loading to finish and then filter the stack list and bake the search
 						CompletableFuture<Void> bakeFilteredSearchFuture = CompletableFuture.allOf(bakeIndexFuture, miscFuture).thenRunAsync(() -> {
 							runStep(EmiPort.literal("Filtering index"), "filter_index", EmiStackList::bakeFiltered);
 						}, executor).thenRunAsync(() -> {
 							pushStep(EmiPort.literal("Baking search"), "baking_search", 15_000);
 							EmiSearch.bake(executor);
 						}, executor).orTimeout(60_000, TimeUnit.MILLISECONDS).whenComplete((result, exception) -> {
+							popStep("baking_search");
 							if (exception instanceof TimeoutException) {
 								EmiReloadLog.warn("EMI reload timed out while baking search. EMI searching may be not work correctly.");
 							}
-							popStep("baking_search");
 						});
 
+						//wait for filter baking and search baking to finish
 						CompletableFuture.allOf(recipesFuture, bakeFilteredSearchFuture).join();
+						testRestart(retries);
 
 						runStep(EmiPort.literal("Finishing up"), "finish_up", () -> {
 							EmiScreenManager.search.update();
@@ -452,7 +430,6 @@ public class EmiReloadManager {
 							EmiReloadLog.bake();
 							EmiLog.info("Reloaded EMI in " + (System.currentTimeMillis() - reloadStart) + "ms");
 						});
-						flag.set(true);
 						reloadProfile.log();
 						status = 2;
 					} catch (Throwable e) {
@@ -466,15 +443,57 @@ public class EmiReloadManager {
 				thread = null;
 			}
 
+			private CompletableFuture<InitContext> initializePlugin(EmiPluginContainer container) {
+				return CompletableFuture.supplyAsync(() -> {
+					EmiInitRegistryAsyncImpl initRegistry = new EmiInitRegistryAsyncImpl();
+					return supplyStep(EmiPort.literal("Initializing plugin from " + container.id()), container.id() + "_init", 5_000, () -> {
+						long start = System.currentTimeMillis();
+						try {
+							container.plugin().initialize(initRegistry);
+							EmiLog.info("Initialized plugin from " + container.id() + " in " + (System.currentTimeMillis() - start) + "ms");
+						} catch (Throwable e) {
+							EmiReloadLog.warn("Exception initializing plugin provided by " + container.id(), e);
+							return new InitContext(Optional.empty(), container.id());
+						}
+						return new InitContext(Optional.of(initRegistry), container.id());
+					});
+				}, executor).orTimeout(15_000, TimeUnit.MILLISECONDS).whenComplete((result, exception) -> {
+					if (exception instanceof TimeoutException) {
+						EmiReloadLog.warn("Plugin provided by " + container.id() + " timed out while registering. Registration of EMI may be incomplete.");
+					}
+				});
+			}
+
+			private CompletableFuture<RegisterContext> registerPlugin(EmiPluginContainer container) {
+				return CompletableFuture.supplyAsync(() -> {
+					EmiRegistryPluginAsyncImpl registry = new EmiRegistryPluginAsyncImpl(container.id());
+					return supplyStep(EmiPort.literal("Loading plugin from " + container.id()), container.id() + "_register", 10_000, () -> {
+						long start = System.currentTimeMillis();
+						try {
+							container.plugin().register(registry);
+							EmiLog.info("Reloaded plugin from " + container.id() + " in " + (System.currentTimeMillis() - start) + "ms");
+						} catch (Throwable e) {
+							EmiReloadLog.warn("Exception loading plugin provided by " + container.id(), e);
+							return new RegisterContext(Optional.empty(), container);
+						}
+						return new RegisterContext(Optional.of(registry), container);
+					});
+
+				}, executor).orTimeout(60_000, TimeUnit.MILLISECONDS).whenComplete((result, exception) -> {
+					if (exception instanceof TimeoutException) {
+						EmiReloadLog.warn("Plugin provided by " + container.id() + " timed out while registering. Registration of EMI may be incomplete.");
+					}
+				});
+
+			}
+
 			private static int entrypointPriority(EmiPluginContainer container) {
 				return container.id().equals("emi") ? 0 : 1;
 			}
 
-			private record InitContext(Optional<EmiInitRegistryAsyncImpl> initRegistry, String currentContainer) {
-			}
+			private record InitContext(Optional<EmiInitRegistryAsyncImpl> initRegistry, String currentContainer) { }
 
-			private record RegisterContext(Optional<EmiRegistryPluginAsyncImpl> registry, EmiPluginContainer container) {
-			}
+			private record RegisterContext(Optional<EmiRegistryPluginAsyncImpl> registry, EmiPluginContainer container) { }
 		}
 
 	private static class Profile {

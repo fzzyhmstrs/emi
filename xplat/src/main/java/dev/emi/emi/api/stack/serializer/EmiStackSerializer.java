@@ -21,7 +21,7 @@ import net.minecraft.util.JsonHelper;
 
 public interface EmiStackSerializer<T extends EmiStack> extends EmiIngredientSerializer<T> {
 	static final Pattern STACK_REGEX = Pattern.compile("^([\\w_\\-./]+):([\\w_\\-.]+):([\\w_\\-./]+)(\\{.*\\})?$");
-	
+
 	EmiStack create(Identifier id, ComponentChanges componentChanges, long amount);
 
 	private static <T> DynamicOps<T> withRegistryAccess(DynamicOps<T> ops) {
@@ -76,7 +76,7 @@ public interface EmiStackSerializer<T extends EmiStack> extends EmiIngredientSer
 				}
 				return stack;
 			} catch (Exception e) {
-				EmiLog.error("Error parsing NBT in deserialized stack", e);
+				EmiLog.error("Error parsing NBT in deserialized stack " + id, e);
 				return EmiStack.EMPTY;
 			}
 		}

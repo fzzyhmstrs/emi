@@ -16,6 +16,7 @@ import dev.emi.emi.api.stack.EmiStack;
 import dev.emi.emi.api.stack.serializer.EmiIngredientSerializer;
 import dev.emi.emi.data.EmiAlias;
 import dev.emi.emi.runtime.EmiHidden;
+import dev.emi.emi.runtime.EmiLog;
 import dev.emi.emi.runtime.EmiReloadLog;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.Screen;
@@ -55,13 +56,12 @@ public class EmiRegistryPluginAsyncImpl implements EmiRegistry {
 	private final Map<Object, Function<Comparison, Comparison>> comparisons = Maps.newHashMap();
 	private final List<EmiAlias.Baked> registryAliases = Lists.newArrayList();
 	private final List<EmiRecipeDecorator> decorators = Lists.newArrayList();
+	private int added = 0;
 
-	final int order;
 	private final String id;
 
-	public EmiRegistryPluginAsyncImpl(String id, int order) {
+	public EmiRegistryPluginAsyncImpl(String id) {
 		this.id = id;
-		this.order = order;
 	}
 
 	@Override
@@ -91,6 +91,7 @@ public class EmiRegistryPluginAsyncImpl implements EmiRegistry {
 		} else if (recipe.getOutputs() == null) {
 			EmiReloadLog.warn("Recipe " + recipe.getId() + " from plugin " + id + " provides null outputs and cannot be added");
 		} else {
+			++added;
 			recipes.add(recipe);
 		}
 	}
@@ -185,6 +186,7 @@ public class EmiRegistryPluginAsyncImpl implements EmiRegistry {
 	}
 
 	public void collectRegistry() {
+		EmiLog.LOG.info("Added {} recipes for plugin {}", added, id);
 		categories.forEach(EmiRecipes::addCategory);
 		for (Map.Entry<EmiRecipeCategory, List<EmiIngredient>> entry : workstations.entrySet()) {
 			for (EmiIngredient ingredient : entry.getValue()) {
