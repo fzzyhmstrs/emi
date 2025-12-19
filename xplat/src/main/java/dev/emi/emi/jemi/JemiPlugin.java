@@ -4,6 +4,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiPredicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -118,11 +119,18 @@ public class JemiPlugin implements IModPlugin, EmiPlugin {
 		JemiPlugin.runtime = null;
 	}
 
+	private final Map<EmiRecipeCategory, AtomicInteger> recipeCounts = Maps.newHashMap();
+
+	private void addRecipe(EmiRegistry registry, EmiRecipe recipe) {
+		recipeCounts.computeIfAbsent(recipe.getCategory(), (c) -> new AtomicInteger()).incrementAndGet();
+		registry.addRecipe(recipe);
+	}
+
 	@Override
 	@SuppressWarnings({"rawtypes", "unchecked"})
 	public void register(EmiRegistry registry) {
 		EmiLog.info("[JEMI] Waiting for JEI to finish reloading...");
-		EmiReloadManager.pushStep(EmiPort.literal("Waiting for JEI to finish..."), "jei_runtime", 20_000);
+		EmiReloadManager.step(EmiPort.literal("Waiting for JEI to finish..."), 20_000);
 		try {
 			while (true) {
 				if (runtime != null) {
@@ -138,7 +146,7 @@ public class JemiPlugin implements IModPlugin, EmiPlugin {
 
 		Set<String> handledNamespaces = EmiAgnos.getPlugins().stream().map(EmiPluginContainer::id).collect(Collectors.toSet());
 
-		EmiReloadManager.pushStep(EmiPort.literal("Loading information from JEI..."), "jei_info", 5_000);
+		EmiReloadManager.step(EmiPort.literal("Loading information from JEI..."), 5_000);
 		registry.addGenericExclusionArea((screen, consumer) -> {
 			if (runtime != null && runtime.getScreenHelper() != null) {
 				List<Rect2i> areas = runtime.getScreenHelper().getGuiExclusionAreas(screen).toList();
@@ -252,7 +260,7 @@ public class JemiPlugin implements IModPlugin, EmiPlugin {
 				List<?> recipes = runtime.getRecipeManager().createRecipeLookup(type).includeHidden().get().toList();
 				for (Object r : recipes) {
 					try {
-						registry.addRecipe(new JemiRecipe(category, c, r));
+						addRecipe(registry, new JemiRecipe(category, c, r));
 					} catch (Throwable t) {
 						EmiLog.error("Exception thrown adding adding JEI recipe", t);
 					}
@@ -262,6 +270,10 @@ public class JemiPlugin implements IModPlugin, EmiPlugin {
 			} finally {
 				EmiReloadManager.popStep("jei_recipe_" + name);
 			}
+		}
+
+		for (Map.Entry<EmiRecipeCategory, AtomicInteger> entry : recipeCounts.entrySet()) {
+			EmiLog.LOG.info("Added {} JEMI recipes for category {}", entry.getValue().get(), entry.getKey().id);
 		}
 	}
 
@@ -293,7 +305,7 @@ public class JemiPlugin implements IModPlugin, EmiPlugin {
 		}
 
 		for (Text text : identical.keySet()) {
-			registry.addRecipe(new EmiInfoRecipe(identical.get(text).stream().map(s -> (EmiIngredient) s).toList(), List.of(text), null));
+			addRecipe(registry, new EmiInfoRecipe(identical.get(text).stream().map(s -> (EmiIngredient) s).toList(), List.of(text), null));
 		}
 	}
 
@@ -303,7 +315,7 @@ public class JemiPlugin implements IModPlugin, EmiPlugin {
 		List<RecipeEntry<CraftingRecipe>> recipes = Stream.concat(
 			runtime.getRecipeManager().createRecipeLookup(category.getRecipeType()).includeHidden().get(),
 			registry.getRecipeManager().listAllOfType(net.minecraft.recipe.RecipeType.CRAFTING).stream()
-				.filter(r -> r.value() instanceof SpecialCraftingRecipe)
+					.filter(r -> r.value() instanceof SpecialCraftingRecipe)
 		).distinct().toList();
 		for (RecipeEntry<CraftingRecipe> recipe : recipes) {
 			try {
@@ -354,7 +366,7 @@ public class JemiPlugin implements IModPlugin, EmiPlugin {
 							replaced.add(replacement.getId());
 						}
 						replacements.add(replacement);
-						registry.addRecipe(replacement);
+						addRecipe(registry, replacement);
 					}
 				}
 			} catch (Throwable t) {
