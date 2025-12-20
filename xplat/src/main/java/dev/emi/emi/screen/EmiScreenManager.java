@@ -647,10 +647,10 @@ public class EmiScreenManager {
 			EmiProfiler.pop();
 			lastHoveredCraftable = null;
 			return;
-		} else if (EmiRecipes.activeWorker != null) {
+		} /*else if (EmiRecipes.activeWorker != null) {
 			int bakingX = getDebugTextX();
 			context.drawTextWithShadow(EmiPort.translatable("emi.reloading.still_baking_recipes"), bakingX, base.screen().height - 16);
-		} else {
+		}*/ else {
 			renderDevMode(context, mouseX, mouseY, delta, base);
 		}
 		EmiProfiler.push("sidebars");

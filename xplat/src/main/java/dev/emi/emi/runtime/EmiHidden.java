@@ -20,12 +20,13 @@ import dev.emi.emi.api.stack.serializer.EmiIngredientSerializer;
 import dev.emi.emi.data.EmiData;
 import dev.emi.emi.data.IndexStackData;
 import dev.emi.emi.registry.EmiStackList;
+import net.minecraft.util.Identifier;
 
 public class EmiHidden {
 	// Data loaded
 	private static volatile Set<EmiIngredient> disabledStacks = Sets.newHashSet();
 	private static volatile List<IndexStackData.Filter> disabledFilters = Lists.newArrayList();
-	private static final ConcurrentHashMap<String, Boolean> disabledFilterLookup = new ConcurrentHashMap<>();
+	private static final ConcurrentHashMap<Identifier, Boolean> disabledFilterLookup = new ConcurrentHashMap<>();
 	// Plugin defined
 	public static Set<EmiIngredient> pluginDisabledStacks = Sets.newHashSet();
 	public static List<Predicate<EmiStack>> pluginDisabledFilters = Lists.newArrayList();
@@ -97,9 +98,10 @@ public class EmiHidden {
 					continue outer;
 				}
 			}
-			boolean filtered = disabledFilterLookup.computeIfAbsent("" + s.getId(), id -> {
+			boolean filtered = disabledFilterLookup.computeIfAbsent(s.getId(), id -> {
+				String str = id.toString();
 				for (IndexStackData.Filter filter : disabledFilters) {
-					if (filter.filter().test(id)) {
+					if (filter.filter().test(str)) {
 						return true;
 					}
 				}

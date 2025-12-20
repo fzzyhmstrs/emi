@@ -1,16 +1,20 @@
 package dev.emi.emi.registry;
 
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
+import dev.emi.emi.runtime.EmiReloadManager;
+import net.minecraft.util.Pair;
 import org.jetbrains.annotations.Nullable;
 
-import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
@@ -45,7 +49,7 @@ import net.minecraft.recipe.RecipeManager;
 import net.minecraft.util.Identifier;
 
 public class EmiRecipes {
-	public static volatile Worker activeWorker = null;
+	//public static volatile Worker activeWorker = null;
 	public static EmiRecipeManager manager = Manager.EMPTY;
 	public static List<Consumer<Consumer<EmiRecipe>>> lateRecipes = Lists.newArrayList();
 	public static List<Predicate<EmiRecipe>> invalidators = Lists.newArrayList();
@@ -60,7 +64,7 @@ public class EmiRecipes {
 	public static Map<Recipe<?>, Identifier> recipeIds = Map.of();
 
 	public static void clear() {
-		setWorker(null);
+		//setWorker(null);
 		lateRecipes.clear();
 		invalidators.clear();
 		categories.clear();
@@ -81,7 +85,7 @@ public class EmiRecipes {
 		}
 	}
 
-	public static void bake() {
+	public static void bake(Executor executor) {
 		long start = System.currentTimeMillis();
 		recipes.addAll(EmiData.recipes.stream().map(r -> r.get()).toList());
 		categories.sort(Comparator.comparingInt(EmiRecipeCategoryProperties::getOrder));
@@ -106,18 +110,21 @@ public class EmiRecipes {
 			return false;
 		});
 
-		List<EmiRecipe> filtered = recipes.stream().filter(r -> {
-			try {
-				for (Predicate<EmiRecipe> predicate : invalidators) {
-					if (predicate.test(r)) {
-						return false;
+		List<EmiRecipe> filtered = EmiReloadManager.profileStep("bake_recipes_filter", () -> {
+			return recipes.stream().filter(r -> {
+				try {
+					for (Predicate<EmiRecipe> predicate : invalidators) {
+						if (predicate.test(r)) {
+							return false;
+						}
 					}
+				} catch (Throwable e) {
+					EmiReloadLog.warn("Exception filtering recipe " + r.getId(), e);
 				}
-			} catch (Throwable e) {
-				EmiReloadLog.warn("Exception filtering recipe " + r.getId(), e);
-			}
-			return true;
-		}).toList();
+				return true;
+			}).toList();
+		});
+
 		Map<EmiRecipeCategory, List<EmiIngredient>> filteredWorkstations = Maps.newHashMap();
 		for (Map.Entry<EmiRecipeCategory, List<EmiIngredient>> entry : workstations.entrySet()) {
 			List<EmiIngredient> w = entry.getValue().stream().filter(s -> !EmiHidden.isDisabled(s)).toList();
@@ -125,8 +132,8 @@ public class EmiRecipes {
 				filteredWorkstations.put(entry.getKey(), w);
 			}
 		}
-		manager = new Manager(categories, filteredWorkstations, filtered, false);
-		setWorker(new Worker(categories, filteredWorkstations, filtered));
+		manager = new Manager(executor, categories, filteredWorkstations, filtered, true);
+		//setWorker(new Worker(categories, filteredWorkstations, filtered));
 		EmiLog.info("Baked " + recipes.size() + " recipes in " + (System.currentTimeMillis() - start) + "ms");
 	}
 
@@ -142,14 +149,14 @@ public class EmiRecipes {
 		recipes.add(recipe);
 	}
 
-	private static synchronized void setWorker(Worker worker) {
+	/*private static synchronized void setWorker(Worker worker) {
 		activeWorker = worker;
 		if (worker != null) {
 			Thread thread = new Thread(activeWorker);
 			thread.setName("EMI Recipe Worker");
 			thread.start();
 		}
-	}
+	}*/
 
 	private static class Manager implements EmiRecipeManager {
 		public static final EmiRecipeManager EMPTY = new Manager();
@@ -167,44 +174,44 @@ public class EmiRecipes {
 			this.recipes = List.of();
 		}
 
-		public Manager(List<EmiRecipeCategory> categories, Map<EmiRecipeCategory, List<EmiIngredient>> workstations, List<EmiRecipe> recipes, boolean doSort) {
+		public Manager(Executor executor, List<EmiRecipeCategory> categories, Map<EmiRecipeCategory, List<EmiIngredient>> workstations, List<EmiRecipe> recipes, boolean doSort) {
 			this.categories = categories.stream().distinct().toList();
 			this.workstations = workstations;
 			this.recipes = List.copyOf(recipes);
 
 			Object2IntMap<Identifier> duplicateIds = new Object2IntOpenHashMap<>();
 			Set<Identifier> incorrectIds = new ObjectArraySet<>();
-			var blah = categories.stream().map((c) -> c + " " + c.id).toList().toString();
-			for (EmiRecipe recipe : this.recipes) {
-				Identifier id = recipe.getId();
-				EmiRecipeCategory category = recipe.getCategory();
-				if (!categories.contains(category)) {
-					EmiLog.error(category + " " + category.id);
-					EmiLog.error(blah);
-					EmiReloadLog.warn("Recipe " + id + " loaded with unregistered category: " + category.getId());
-				}
-				if (EmiConfig.logNonTagIngredients && recipe.supportsRecipeTree()) {
-					Set<EmiIngredient> seen = new ObjectArraySet<>(0);
-					for (EmiIngredient ingredient : recipe.getInputs()) {
-						if (ingredient instanceof ListEmiIngredient && !seen.contains(ingredient)) {
-							EmiReloadLog.warn("Recipe " + recipe.getId() + " uses non-tag ingredient: " + ingredient);
-							seen.add(ingredient);
+			EmiReloadManager.profileStep("bake_recipe_categorize_" + doSort, () -> {
+				for (EmiRecipe recipe : this.recipes) {
+					Identifier id = recipe.getId();
+					EmiRecipeCategory category = recipe.getCategory();
+					if (!categories.contains(category)) {
+						EmiReloadLog.warn("Recipe " + id + " loaded with unregistered category: " + category.getId());
+					}
+					if (EmiConfig.logNonTagIngredients && recipe.supportsRecipeTree()) {
+						Set<EmiIngredient> seen = new ObjectArraySet<>(0);
+						for (EmiIngredient ingredient : recipe.getInputs()) {
+							if (ingredient instanceof ListEmiIngredient && !seen.contains(ingredient)) {
+								EmiReloadLog.warn("Recipe " + recipe.getId() + " uses non-tag ingredient: " + ingredient);
+								seen.add(ingredient);
+							}
+						}
+					}
+					byCategory.computeIfAbsent(category, a -> Lists.newArrayList()).add(recipe);
+					if (id != null) {
+						if (byId.containsKey(id)) {
+							duplicateIds.put(id, duplicateIds.getOrDefault(id, 1) + 1);
+						} else {
+							byId.put(id, recipe);
+						}
+
+						if (EmiConfig.devMode && !id.getPath().startsWith("/") && !recipeIds.containsValue(id)) {
+							incorrectIds.add(id);
 						}
 					}
 				}
-				byCategory.computeIfAbsent(category, a -> Lists.newArrayList()).add(recipe);
-				if (id != null) {
-					if (byId.containsKey(id)) {
-						duplicateIds.put(id, duplicateIds.getOrDefault(id, 1) + 1);
-					} else {
-						byId.put(id, recipe);
-					}
+			});
 
-					if (EmiConfig.devMode && !id.getPath().startsWith("/") && !recipeIds.containsValue(id)) {
-						incorrectIds.add(id);
-					}
-				}
-			}
 
 			if (EmiConfig.devMode) {
 				for (Identifier id : duplicateIds.keySet()) {
@@ -215,69 +222,94 @@ public class EmiRecipes {
 				}
 			}
 
-			Map<EmiStack, Set<EmiRecipe>> byInput = new Object2ObjectOpenCustomHashMap<>(new EmiStackList.ComparisonHashStrategy());
-			Map<EmiStack, Set<EmiRecipe>> byOutput = new Object2ObjectOpenCustomHashMap<>(new EmiStackList.ComparisonHashStrategy());
+			EmiReloadManager.profileStep("bake_recipe_bake_" + doSort);
 
-			for (EmiRecipeCategory category : byCategory.keySet()) {
-				String key = EmiUtil.translateId("emi.category.", category.getId());
-				if (category.getName().equals(EmiPort.translatable(key)) && !I18n.hasTranslation(key)) {
-					EmiReloadLog.warn("Untranslated recipe category " + category.getId());
-				}
-				List<EmiRecipe> cRecipes = byCategory.get(category);
-				Comparator<EmiRecipe> sort = EmiRecipeCategoryProperties.getSort(category);
-				if (doSort && sort != EmiRecipeSorting.none()) {
-					cRecipes = cRecipes.stream().sorted(sort).collect(Collectors.toList());
-					EmiRecipeSorter.clear();
-				}
-				byCategory.put(category, cRecipes);
-				for (EmiRecipe recipe : cRecipes) {
-					recipe.getInputs().stream().flatMap(i -> i.getEmiStacks().stream()).forEach(i -> {
-						byInput.computeIfAbsent(i.copy(), b -> Sets.newLinkedHashSet()).add(recipe);
-					});
-					recipe.getCatalysts().stream().flatMap(i -> i.getEmiStacks().stream()).forEach(i -> {
-						byInput.computeIfAbsent(i.copy(), b -> Sets.newLinkedHashSet()).add(recipe);
-					});
-					recipe.getOutputs().stream().forEach(i -> {
-						byOutput.computeIfAbsent(i.copy(), b -> Sets.newLinkedHashSet()).add(recipe);
-					});
+			if (doSort) {
+				for (Map.Entry<EmiRecipeCategory, List<EmiRecipe>> cEntries : byCategory.entrySet()) {
+					EmiRecipeCategory category = cEntries.getKey();
+					List<EmiRecipe> cRecipes = new ArrayList<>(cEntries.getValue());
+					Comparator<EmiRecipe> sort = EmiRecipeCategoryProperties.getSort(category);
+					if (sort != EmiRecipeSorting.none()) {
+						cRecipes = cRecipes.stream().sorted(sort).collect(Collectors.toList());
+						EmiRecipeSorter.clear();
+					}
+					byCategory.put(category, cRecipes);
 				}
 			}
-			for (EmiStack key : byInput.keySet()) {
-				Set<EmiRecipe> r = byInput.getOrDefault(key, null);
-				if (r != null) {
-					this.byInput.put(key, r.stream().toList());
-				} else {
-					EmiReloadLog.warn("Stack illegally self-mutated during recipe bake, causing recipe loss: " + key);
+
+			List<CompletableFuture<Pair<Map<EmiStack, Set<EmiRecipe>>, Map<EmiStack, Set<EmiRecipe>>>>> futures = Lists.newArrayList();
+
+			for (Map.Entry<EmiRecipeCategory, List<EmiRecipe>> cEntries : byCategory.entrySet()) {
+				futures.add(CompletableFuture.supplyAsync(() -> {
+					Map<EmiStack, Set<EmiRecipe>> cByInputSets = new Object2ObjectOpenCustomHashMap<>(new EmiStackList.ComparisonHashStrategy());
+					Map<EmiStack, Set<EmiRecipe>> cByOutputSets = new Object2ObjectOpenCustomHashMap<>(new EmiStackList.ComparisonHashStrategy());
+					EmiRecipeCategory category = cEntries.getKey();
+					List<EmiRecipe> cRecipes = cEntries.getValue();
+					String key = EmiUtil.translateId("emi.category.", category.getId());
+					if (category.getName().equals(EmiPort.translatable(key)) && !I18n.hasTranslation(key)) {
+						EmiReloadLog.warn("Untranslated recipe category " + category.getId());
+					}
+
+					for (EmiRecipe recipe : cRecipes) {
+						recipe.getInputs().stream().flatMap(i -> i.getEmiStacks().stream()).forEach(i -> {
+							cByInputSets.computeIfAbsent(i.copy(), b -> Sets.newLinkedHashSet()).add(recipe);
+						});
+						recipe.getCatalysts().stream().flatMap(i -> i.getEmiStacks().stream()).forEach(i -> {
+							cByInputSets.computeIfAbsent(i.copy(), b -> Sets.newLinkedHashSet()).add(recipe);
+						});
+						recipe.getOutputs().forEach(i -> {
+							cByOutputSets.computeIfAbsent(i.copy(), b -> Sets.newLinkedHashSet()).add(recipe);
+						});
+					}
+					return new Pair<>(cByInputSets, cByOutputSets);
+				}, executor));
+			}
+
+			CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).join();
+
+			Map<EmiStack, List<EmiRecipe>> byInputs = new Object2ObjectOpenCustomHashMap<>(new EmiStackList.ComparisonHashStrategy());
+			Map<EmiStack, List<EmiRecipe>> byOutputs = new Object2ObjectOpenCustomHashMap<>(new EmiStackList.ComparisonHashStrategy());
+
+			for (CompletableFuture<Pair<Map<EmiStack, Set<EmiRecipe>>, Map<EmiStack, Set<EmiRecipe>>>> future: futures) {
+				Pair<Map<EmiStack, Set<EmiRecipe>>, Map<EmiStack, Set<EmiRecipe>>> pair = future.join();
+				for (Map.Entry<EmiStack, Set<EmiRecipe>> entry : pair.getLeft().entrySet()) {
+					byInput.computeIfAbsent(entry.getKey(), (s) -> Lists.newArrayList()).addAll(entry.getValue());
+				}
+				for (Map.Entry<EmiStack, Set<EmiRecipe>> entry : pair.getRight().entrySet()) {
+					byOutputs.computeIfAbsent(entry.getKey(), (s) -> Lists.newArrayList()).addAll(entry.getValue());
 				}
 			}
-			for (EmiStack key : byOutput.keySet()) {
-				Set<EmiRecipe> r = byOutput.getOrDefault(key, null);
-				if (r != null) {
-					this.byOutput.put(key, r.stream().toList());
-				} else {
-					EmiReloadLog.warn("Stack illegally self-mutated during recipe bake, causing recipe loss: " + key);
-				}
-			}
-			for (EmiRecipeCategory category : workstations.keySet()) {
-				List<EmiIngredient> w = workstations.getOrDefault(category, null);
-				if (w != null) {
-					workstations.put(category, w.stream().distinct().toList());
-				} else {
-					EmiReloadLog.warn("Recipe category illegally self-mutated during recipe bake, causing recipe loss: " + category);
-				}
-			}
-			for (Map.Entry<EmiRecipeCategory, List<EmiRecipe>> entry : byCategory.entrySet()) {
-				for (EmiIngredient ingredient : workstations.getOrDefault(entry.getKey(), List.of())) {
-					for (EmiStack stack : ingredient.getEmiStacks()) {
-						byWorkstation.computeIfAbsent(stack, (s) -> Lists.newArrayList()).addAll(entry.getValue());
+
+			this.byInput = byInputs;
+			this.byOutput = byOutputs;
+			EmiReloadManager.popStep("bake_recipe_bake_" + doSort);
+
+			EmiReloadManager.profileStep("bake_recipe_finalize_workstations_" + doSort, () -> {
+				for (EmiRecipeCategory category : workstations.keySet()) {
+					List<EmiIngredient> w = workstations.getOrDefault(category, null);
+					if (w != null) {
+						workstations.put(category, w.stream().distinct().toList());
+					} else {
+						EmiReloadLog.warn("Recipe category illegally self-mutated during recipe bake, causing recipe loss: " + category);
 					}
 				}
-			}
+			});
+
+			EmiReloadManager.profileStep("bake_recipe_finalize_by_stations_" + doSort, () -> {
+				for (Map.Entry<EmiRecipeCategory, List<EmiRecipe>> entry : byCategory.entrySet()) {
+					for (EmiIngredient ingredient : workstations.getOrDefault(entry.getKey(), List.of())) {
+						for (EmiStack stack : ingredient.getEmiStacks()) {
+							byWorkstation.computeIfAbsent(stack, (s) -> Lists.newArrayList()).addAll(entry.getValue());
+						}
+					}
+				}
+			});
 
 			if (EmiConfig.devMode) {
 				EmiDev.duplicateRecipeIds = duplicateIds.keySet();
 				EmiDev.incorrectRecipeIds = incorrectIds;
 			}
+			EmiReloadManager.popStep("bake_recipe_finalize_" + doSort);
 		}
 
 		@Override
@@ -316,7 +348,7 @@ public class EmiRecipes {
 		}
 	}
 
-	private static class Worker implements Runnable {
+	/*private static class Worker implements Runnable {
 		private List<EmiRecipeCategory> categories;
 		private Map<EmiRecipeCategory, List<EmiIngredient>> workstations;
 		private List<EmiRecipe> recipes;
@@ -338,5 +370,5 @@ public class EmiRecipes {
 			}
 			setWorker(null);
 		}
-	}
+	}*/
 }

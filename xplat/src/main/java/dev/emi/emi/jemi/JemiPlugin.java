@@ -312,7 +312,6 @@ public class JemiPlugin implements IModPlugin, EmiPlugin {
 
 	private void addCraftingRecipes(EmiRegistry registry, IRecipeCategory<RecipeEntry<CraftingRecipe>> category) {
 		Set<Identifier> replaced = Sets.newHashSet();
-		Set<EmiRecipe> replacements = Sets.newHashSet();
 		List<RecipeEntry<CraftingRecipe>> recipes = Stream.concat(
 			runtime.getRecipeManager().createRecipeLookup(category.getRecipeType()).includeHidden().get(),
 			registry.getRecipeManager().listAllOfType(net.minecraft.recipe.RecipeType.CRAFTING).stream()
@@ -338,7 +337,7 @@ public class JemiPlugin implements IModPlugin, EmiPlugin {
 					if (inputs.stream().anyMatch(i -> !i.isEmpty()) && outputs.stream().anyMatch(o -> !o.isEmpty())) {
 						EmiRecipe replacement;
 						if (outputs.size() > 1) {
-							replacement = new EmiPatternCraftingRecipe(inputs, EmiStack.EMPTY, category.getRegistryName(recipe), builder.shapeless) {
+							replacement = new JemiPatternCraftingRecipe(inputs, EmiStack.EMPTY, category.getRegistryName(recipe), builder.shapeless) {
 
 								@Override
 								public List<EmiStack> getOutputs() {
@@ -361,12 +360,11 @@ public class JemiPlugin implements IModPlugin, EmiPlugin {
 
 							};
 						} else {
-							replacement = new EmiCraftingRecipe(inputs, outputs.get(0), category.getRegistryName(recipe), builder.shapeless);
+							replacement = new JemiCraftingRecipe(inputs, outputs.get(0), category.getRegistryName(recipe), builder.shapeless);
 						}
 						if (replacement.getId() != null) {
 							replaced.add(replacement.getId());
 						}
-						replacements.add(replacement);
 						addRecipe(registry, replacement);
 					}
 				}
@@ -374,7 +372,7 @@ public class JemiPlugin implements IModPlugin, EmiPlugin {
 				EmiLog.error("[JEMI] Exception thrown setting JEI crafting recipe", t);
 			}
 		}
-		registry.removeRecipes(r -> r instanceof EmiCraftingRecipe && replaced.contains(r.getId()) && !replacements.contains(r));
+		registry.removeRecipes(r -> r instanceof EmiCraftingRecipe && replaced.contains(r.getId()) && !(r instanceof JemiReplacementRecipe));
 	}
 
 	@SuppressWarnings({"unchecked"})

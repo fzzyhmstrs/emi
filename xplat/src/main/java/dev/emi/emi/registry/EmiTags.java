@@ -1,12 +1,19 @@
 package dev.emi.emi.registry;
 
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.function.Consumer;
+import java.util.stream.Collector;
 import java.util.stream.Collectors;
 
+import dev.emi.emi.runtime.EmiLog;
+import dev.emi.emi.runtime.EmiReloadManager;
+import net.minecraft.util.Pair;
 import org.jetbrains.annotations.Nullable;
 
 import com.google.common.collect.Lists;
@@ -81,6 +88,12 @@ public class EmiTags {
 
 	@SuppressWarnings({"unchecked", "rawtypes"})
 	public static <T> EmiIngredient getIngredient(Class<T> clazz, List<EmiStack> stacks, long amount) {
+		if (stacks.size() == 1) {
+			EmiStack stack = stacks.get(0);
+			if (!stack.isEmpty()) {
+				return stack.copy().setAmount(amount);
+			}
+		}
 		Map<T, EmiStack> map = Maps.newHashMap();
 		for (EmiStack stack : stacks) {
 			if (!stack.isEmpty()) {
@@ -250,8 +263,9 @@ public class EmiTags {
 		CACHED_TAGS.clear();  //
 		PrepareResult result = new PrepareResult(Maps.newHashMap(), Maps.newHashMap(), Maps.newHashMap(), Lists.newArrayList());
 		for (Registry<?> registry : ADAPTERS_BY_REGISTRY.keySet()) {
-			reloadTags(registry, result);
+			prepareTags(registry, result);
 		}
+
 		return result;
 	}
 
@@ -263,29 +277,39 @@ public class EmiTags {
 	}
 
 	@SuppressWarnings({"unchecked", "rawtypes"})
-	private static <T> void reloadTags(Registry<T> registry, PrepareResult result) {
+	private static <T> void prepareTags(Registry<T> registry, PrepareResult result) {
 		Set<T> hidden = EmiUtil.values(TagKey.of(registry.getKey(), HIDDEN_FROM_RECIPE_VIEWERS)).map(RegistryEntry::value).collect(Collectors.toSet());
 		Identifier rid = registry.getKey().getValue();
-		List<TagKey<T>> tags = registry.streamTags()
-			.filter(key -> !exclusions.contains(rid, key.id()) && !hidden.containsAll(EmiUtil.values(key).map(RegistryEntry::value).toList()))
+		EmiReloadManager.profileStep("build_tag_list_" + rid);
+		List<Pair<TagKey<T>, List<T>>> tagPairs = registry.streamTagsAndEntries()
+			.map(entry -> new Pair<>(entry.getFirst(), entry.getSecond().stream().map(RegistryEntry::value).toList()))
+			.filter(pair -> !(exclusions.contains(rid, pair.getLeft().id()) || hidden.containsAll(pair.getRight())))
 			.toList();
-		logUntranslatedTags(tags);
-		tags = consolodateTags(tags);
+		EmiReloadManager.popStep("build_tag_list_" + rid);
+		EmiReloadManager.profileStep("process_tag_list_" + rid);
+		logUntranslatedTags(tagPairs);
+		List<TagKey<T>> tags = consolidateTags(tagPairs);
+		EmiReloadManager.popStep("process_tag_list_" + rid);
+		EmiReloadManager.profileStep("build_tag_contents_" + rid);
+		EmiRegistryAdapter<T> adapter = (EmiRegistryAdapter<T>) ADAPTERS_BY_REGISTRY.get(registry);
 		for (TagKey<T> key : tags) {
-			List<T> contents = EmiUtil.values(key).map(i -> i.value()).toList();
+			List<T> contents = EmiUtil.values(key).map(RegistryEntry::value).toList();
 			result.TAG_CONTENTS.put(key, contents);
-			List<T> values = contents.stream().filter(s -> !EmiHidden.isDisabled(stackFromKey(key, s))).toList();
+			List<T> values = contents.stream().filter(s -> !EmiHidden.isDisabled(adapter.of(s, EmiPort.emptyExtraData(), 1))).toList();
 			if (values.isEmpty()) {
 				result.TAG_VALUES.put(key, contents);
 			} else {
 				result.TAG_VALUES.put(key, values);
 			}
 		}
-		result.TAGS.addAll(tags.stream().sorted((a, b) -> a.toString().compareTo(b.toString())).toList());
+		EmiReloadManager.popStep("build_tag_contents_" + rid);
+		EmiReloadManager.profileStep("build_tag_lists_" + rid);
+		result.TAGS.addAll(tags.stream().sorted(Comparator.comparing(TagKey::toString)).toList());
 		tags = tags.stream()
-			.sorted((a, b) -> Long.compare(EmiUtil.values(b).count(), EmiUtil.values(a).count()))
-			.toList();
+				.sorted((a, b) -> Long.compare(EmiUtil.values(b).count(), EmiUtil.values(a).count()))
+				.toList();
 		result.SORTED_TAGS.put(registry.getKey().getValue(), (List) tags);
+		EmiReloadManager.popStep("build_tag_lists_" + rid);
 	}
 
 	@SuppressWarnings("unchecked")
@@ -297,12 +321,12 @@ public class EmiTags {
 		throw new UnsupportedOperationException("Unsupported tag registry " + key);
 	}
 
-	private static <T> void logUntranslatedTags(List<TagKey<T>> tags) {
+	private static <T> void logUntranslatedTags(List<Pair<TagKey<T>, List<T>>> tags) {
 		if (EmiConfig.logUntranslatedTags) {
 			List<String> untranslated = Lists.newArrayList();
-			for (TagKey<T> tag : tags) {
-				if (!hasTranslation(tag)) {
-					untranslated.add(tag.id().toString());
+			for (Pair<TagKey<T>, List<T>> tag : tags) {
+				if (!hasTranslation(tag.getLeft())) {
+					untranslated.add(tag.getLeft().id().toString());
 				}
 			}
 			if (!untranslated.isEmpty()) {
@@ -314,16 +338,15 @@ public class EmiTags {
 		}
 	}
 
-	private static <T> List<TagKey<T>> consolodateTags(List<TagKey<T>> tags) {
+	private static <T> List<TagKey<T>> consolidateTags(List<Pair<TagKey<T>, List<T>>> tags) {
 		Map<Set<T>, TagKey<T>> map = Maps.newHashMap();
-		for (int i = 0; i < tags.size(); i++) {
-			TagKey<T> key = tags.get(i);
-			Set<T> values = EmiUtil.values(key).map(RegistryEntry::value).collect(Collectors.toSet());
+		for (Pair<TagKey<T>, List<T>> pair : tags) {
+			Set<T> values = new HashSet<>(pair.getRight());
 			TagKey<T> original = map.get(values);
 			if (original != null) {
-				map.put(values, betterTag(key, original));
+				map.put(values, betterTag(pair.getLeft(), original));
 			} else {
-				map.put(values, key);
+				map.put(values, pair.getLeft());
 			}
 		}
 		return map.values().stream().toList();
@@ -360,8 +383,17 @@ public class EmiTags {
 		return a.id().toString().length() <= b.id().toString().length() ? a : b;
 	}
 
-	public record PrepareResult(Map<TagKey<?>, List<?>> TAG_CONTENTS,
-	Map<TagKey<?>, List<?>> TAG_VALUES,
-	Map<Identifier, List<TagKey<?>>> SORTED_TAGS,
-	List<TagKey<?>> TAGS) {}
+	public record PrepareResult(
+			Map<TagKey<?>, List<?>> TAG_CONTENTS,
+			Map<TagKey<?>, List<?>> TAG_VALUES,
+			Map<Identifier, List<TagKey<?>>> SORTED_TAGS,
+			List<TagKey<?>> TAGS)
+	{
+		void combine(PrepareResult other) {
+			TAG_CONTENTS.putAll(other.TAG_CONTENTS);
+			TAG_VALUES.putAll(other.TAG_VALUES);
+			SORTED_TAGS.putAll(other.SORTED_TAGS);
+			TAGS.addAll(other.TAGS);
+		}
+	}
 }

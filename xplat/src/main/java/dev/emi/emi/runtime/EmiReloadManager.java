@@ -25,6 +25,7 @@ import java.util.function.Supplier;
 
 import com.google.common.collect.Lists;
 
+import com.google.common.collect.Streams;
 import dev.emi.emi.EmiPort;
 import dev.emi.emi.api.EmiPlugin;
 import dev.emi.emi.api.recipe.EmiRecipe;
@@ -55,7 +56,7 @@ public class EmiReloadManager {
 	// 0 - empty, 1 - reloading, 2 - loaded, -1 - error
 	private static volatile int status = 0;
 	private static Thread thread;
-	private static final ExecutorService executor = Executors.newFixedThreadPool(ForkJoinPool.getCommonPoolParallelism(), Thread.ofPlatform().daemon().name("EMI Reload Worker-", 1).factory());
+	private static final ExecutorService executor = Executors.newFixedThreadPool( Math.max(1, ForkJoinPool.getCommonPoolParallelism() - 2), Thread.ofPlatform().daemon().name("EMI Reload Worker-", 1).factory());
 
 	private static volatile Text reloadStep = EmiPort.literal("");
 	private static final Profile reloadProfile = new Profile();
@@ -177,6 +178,14 @@ public class EmiReloadManager {
 		return t;
 	}
 
+	public static <T>  T profileStep(String key, Supplier<T> supplier) {
+		reloadProfile.pushProfile(key);
+		reloadStarts.put(key, System.currentTimeMillis());
+		T t = supplier.get();
+		popStep(key);
+		return t;
+	}
+
 	public static void profileStep(String key, Runnable runnable) {
 		reloadProfile.pushProfile(key);
 		reloadStarts.put(key, System.currentTimeMillis());
@@ -266,6 +275,14 @@ public class EmiReloadManager {
 							break;
 						}
 
+						CompletableFuture<Void> indexFuture = CompletableFuture.supplyAsync(() -> {
+							pushStep(EmiPort.literal("Constructing index"), "construct_index");
+							return EmiStackList.prepare();
+						}, executor).thenAccept((result) -> {
+							EmiStackList.apply(result);
+							popStep("construct_index");
+						});
+
 						List<EmiPluginContainer> plugins = Lists.newArrayList();
 						List<EmiPluginContainer> lastPlugins = Lists.newArrayList();
 
@@ -287,8 +304,8 @@ public class EmiReloadManager {
 						});
 						testRestart(retries);
 
-						//collect and start plugin workers
-						List<CompletableFuture<InitContext>> whenCompleteInitFutures = plugins.stream().map(this::initializePlugin).toList();
+						//collect and start plugin workers. "last plugins" have no affect here
+						List<CompletableFuture<InitContext>> whenCompleteInitFutures = Streams.concat(plugins.stream(), lastPlugins.stream()).map(this::initializePlugin).toList();
 						//wait in the worker thread for the initialization to complete
 						CompletableFuture.allOf(whenCompleteInitFutures.toArray(CompletableFuture[]::new)).join();
 						testRestart(retries);
@@ -300,9 +317,13 @@ public class EmiReloadManager {
 							}
 						});
 
-						for (EmiPluginContainer container : lastPlugins) {
-							initializePlugin(container).join().initRegistry().ifPresent(EmiInitRegistryAsyncImpl::collectInit);
-						}
+						CompletableFuture<Void> tagsFuture = CompletableFuture.supplyAsync(() -> {
+							pushStep(EmiPort.literal("Processing tags"), "process_tags");
+							return EmiTags.prepare();
+						}, executor).thenAccept((result) -> {
+							EmiTags.apply(result);
+							popStep("process_tags");
+						});
 
 						EmiComparisonDefaults.comparisons = new HashMap<>();
 
@@ -312,22 +333,6 @@ public class EmiReloadManager {
 						}, executor).thenAccept((result) -> {
 							EmiHidden.apply(result);
 							popStep("process_filters");
-						});
-
-						CompletableFuture<Void> tagsFuture = CompletableFuture.supplyAsync(() -> {
-							pushStep(EmiPort.literal("Processing tags"), "process_tags");
-							return EmiTags.prepare();
-						}, executor).thenAccept((result) -> {
-							EmiTags.apply(result);
-							popStep("process_tags");
-						});
-
-						CompletableFuture<Void> indexFuture = CompletableFuture.supplyAsync(() -> {
-							pushStep(EmiPort.literal("Constructing index"), "construct_index");
-							return EmiStackList.prepare();
-						}, executor).thenAccept((result) -> {
-							EmiStackList.apply(result);
-							popStep("construct_index");
 						});
 
 						CompletableFuture<Void> miscFuture = CompletableFuture.runAsync(() -> {
@@ -396,8 +401,12 @@ public class EmiReloadManager {
 								}
 							});
 							testRestart(finalRetries);
+
+						}, executor);
+
+						CompletableFuture<Void> bakeRecipesFuture = CompletableFuture.allOf(bakeIndexFuture, recipesFuture).thenRunAsync(() -> {
 							pushStep(EmiPort.literal("Baking recipes"), "baking_recipes", 15_000);
-							EmiRecipes.bake();
+							EmiRecipes.bake(executor);
 						}, executor).orTimeout(60_000, TimeUnit.MILLISECONDS).whenComplete((result, exception) -> {
 							popStep("baking_recipes");
 							//reload the BoM after recipes are baked
@@ -408,9 +417,11 @@ public class EmiReloadManager {
 						});
 
 						//wait for index bake and then misc loading to finish and then filter the stack list and bake the search
-						CompletableFuture<Void> bakeFilteredSearchFuture = CompletableFuture.allOf(bakeIndexFuture, miscFuture).thenRunAsync(() -> {
+						CompletableFuture<Void> filteredSearchFuture = bakeIndexFuture.thenRunAsync(() -> {
 							runStep(EmiPort.literal("Filtering index"), "filter_index", EmiStackList::bakeFiltered);
-						}, executor).thenRunAsync(() -> {
+						}, executor);
+
+						CompletableFuture<Void> searchFuture = bakeIndexFuture.thenRunAsync(() -> {
 							pushStep(EmiPort.literal("Baking search"), "baking_search", 15_000);
 							EmiSearch.bake(executor);
 						}, executor).orTimeout(60_000, TimeUnit.MILLISECONDS).whenComplete((result, exception) -> {
@@ -421,7 +432,7 @@ public class EmiReloadManager {
 						});
 
 						//wait for filter baking and search baking to finish
-						CompletableFuture.allOf(recipesFuture, bakeFilteredSearchFuture).join();
+						CompletableFuture.allOf(recipesFuture, filteredSearchFuture, searchFuture, bakeRecipesFuture).join();
 						testRestart(retries);
 
 						runStep(EmiPort.literal("Finishing up"), "finish_up", () -> {

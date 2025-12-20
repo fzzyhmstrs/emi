@@ -1,17 +1,23 @@
 package dev.emi.emi.search;
 
-import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executor;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collector;
 import java.util.stream.Collectors;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 
 import dev.emi.emi.EmiPort;
@@ -67,14 +73,15 @@ public class EmiSearch {
 		SuffixArray<SearchStack> tooltips = new SuffixArray<>();
 		SuffixArray<SearchStack> mods = new SuffixArray<>();
 		SuffixArray<EmiStack> aliases = new SuffixArray<>();
-		Set<EmiStack> bakedStacks = Sets.newIdentityHashSet();
+		Set<EmiStack> bakedStacks = Collections.newSetFromMap(new IdentityHashMap<>(EmiStackList.stacks.size()));
 		boolean old = EmiConfig.appendItemModId;
 		EmiConfig.appendItemModId = false;
 
 		EmiReloadManager.profileStep("baking_stack_arrays", () -> {
-			EmiReloadManager.profileStep("creating_search_results");
-			List<SearchBakeResult> bakeResult = EmiStackList.stacks
+			Queue<SearchBakeResult> bakeResult = EmiReloadManager.profileStep("creating_search_results", () -> {
+				return EmiStackList.stacks
 					.parallelStream()
+					.unordered()
 					.map((stack) -> {
 						SearchStack ss = new SearchStack(stack);
 						Text name = NameQuery.getText(stack);
@@ -84,8 +91,17 @@ public class EmiSearch {
 						Identifier id = stack.getId();
 						return new SearchBakeResult(ss, nameString, tooltipString, id);
 					})
-					.collect(Collectors.toCollection(() -> new ArrayList<>(EmiStackList.stacks.size())));
-			EmiReloadManager.popStep("creating_search_results");
+					.collect(Collector.of(
+						ConcurrentLinkedQueue::new,
+						Queue::add,
+						(left, right) -> { left.addAll(right); return left; },
+						Collector.Characteristics.CONCURRENT, Collector.Characteristics.UNORDERED
+					));
+			});
+
+			//Collectors.toCollection(() -> new ArrayList<>(EmiStackList.stacks.size() / 8))
+
+			EmiLog.LOG.debug("Search list size {} vs. created results {}", EmiStackList.stacks.size(), bakeResult.size());
 
 			EmiReloadManager.profileStep("processing_search_bake", () -> {
 				for (SearchBakeResult searchBakeResult : bakeResult) {
@@ -338,5 +354,9 @@ public class EmiSearch {
 		}
 	}
 
-	private record SearchBakeResult(SearchStack stack, String nameString, List<String> tooltip, Identifier id) {}
+	private record SearchBakeResult(
+			SearchStack stack,
+			String nameString,
+			List<String> tooltip,
+			Identifier id) {}
 }

@@ -2,14 +2,18 @@ package dev.emi.emi.registry;
 
 import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
@@ -52,8 +56,22 @@ public class EmiStackList {
 	public static List<Predicate<EmiStack>> invalidators = Lists.newArrayList();
 	public static volatile List<EmiStack> stacks = List.of();
 	public static volatile List<EmiStack> filteredStacks = List.of();
-	private static Object2IntMap<EmiStack> strictIndices = new Object2IntOpenCustomHashMap<>(new StrictHashStrategy());
-	private static Object2IntMap<Object> keyIndices = new Object2IntOpenHashMap<>();
+	private static final Object2IntMap<EmiStack> strictIndices = new Object2IntOpenCustomHashMap<>(new StrictHashStrategy());
+	private static final Object2IntMap<Object> keyIndices = new Object2IntOpenHashMap<>();
+	private static final Predicate<EmiStack> nameIdPredicate = stack -> {
+		String name = "Unknown";
+		try {
+			name = stack.toString();
+			if (name != null && stack.getKey() != null && stack.getName() != null) {
+				return true;
+			}
+			EmiLog.warn("Hiding stack " + name + " with id " + (stack.getId()) + " from index due to returning dangerous values");
+			return false;
+		} catch (Throwable t) {
+			EmiLog.error("Hiding stack " + name + " with id " + (stack.getId()) + " from index due to throwing errors", t);
+			return false;
+		}
+	};
 
 	public static void clear() {
 		invalidators.clear();
@@ -74,22 +92,13 @@ public class EmiStackList {
 		List<IndexGroup> groups = Lists.newArrayList();
 		Map<String, IndexGroup> namespaceGroups = new LinkedHashMap<>();
 		EmiReloadManager.profileStep("stack_registry_prep");
-		for (Item item : EmiPort.getItemRegistry()) {
-			String itemName = "null";
-			try {
-				itemName = item.toString();
-				EmiStack stack = EmiStack.of(item);
-				namespaceGroups.computeIfAbsent(stack.getId().getNamespace(), (k) -> new IndexGroup()).stacks.add(stack);
-			} catch (Exception e) {
-				EmiLog.error("Item " + itemName + " threw while EMI was attempting to construct the index, items may be missing.", e);
-			}
-		}
+
 		EmiReloadManager.popStep("stack_registry_prep");
 		if (EmiConfig.indexSource != IndexSource.REGISTERED) {
 			// There is an unwritten convention that ItemGroup.updateEntries is only invoked on the main thread
 			long groupReloadStart = System.currentTimeMillis();
 			EmiLog.info("Reloading item groups on client thread...");
-			Map<ItemGroup, Collection<ItemStack>> itemGroupToStacksMap = client.submit(() -> {
+			CompletableFuture<Map<ItemGroup, Collection<ItemStack>>> itemGroupToStacksMapFuture = client.submit(() -> {
 				Map<ItemGroup, Collection<ItemStack>> map = new Reference2ReferenceOpenHashMap<>();
 				Consumer<ItemGroup> itemGroupConsumer = group -> {
 					String groupName = "null";
@@ -107,8 +116,14 @@ public class EmiStackList {
 				itemGroups.stream().filter(g -> g.getType() == ItemGroup.Type.CATEGORY).forEach(itemGroupConsumer);
 				itemGroups.stream().filter(g -> g.getType() != ItemGroup.Type.CATEGORY).forEach(itemGroupConsumer);
 				return map;
-			}).join();
+			});
+			if (EmiConfig.indexSource == IndexSource.CREATIVE) {
+				prepareNamespaceGroups(namespaceGroups);
+			}
+			Map<ItemGroup, Collection<ItemStack>> itemGroupToStacksMap = itemGroupToStacksMapFuture.join();
+
 			EmiLog.info("Reloading item groups on client thread took " + (System.currentTimeMillis() - groupReloadStart) + "ms");
+			EmiReloadManager.profileStep("prepare_stacks_after_group");
 			for (ItemGroup group : ItemGroups.getGroups()) {
 				String groupName = "null";
 				try {
@@ -137,7 +152,11 @@ public class EmiStackList {
 					EmiLog.error("Creative item group " + groupName + " threw while EMI was attempting to construct the index, items may be missing.", e);
 				}
 			}
+			EmiReloadManager.popStep("prepare_stacks_after_group");
+		} else {
+			prepareNamespaceGroups(namespaceGroups);
 		}
+		EmiReloadManager.profileStep("finalize_stacks_after_group");
 		groups.addAll(namespaceGroups.values());
 		IndexGroup fluidGroup = new IndexGroup();
 		for (Fluid fluid : EmiPort.getFluidRegistry()) {
@@ -168,7 +187,21 @@ public class EmiStackList {
 				}
 			}
 		}
+		EmiReloadManager.popStep("finalize_stacks_after_group");
 		return newStacks;
+	}
+
+	private static void prepareNamespaceGroups(Map<String, IndexGroup> namespaceGroups) {
+		for (Item item : EmiPort.getItemRegistry()) {
+			String itemName = "null";
+			try {
+				itemName = item.toString();
+				EmiStack stack = EmiStack.of(item);
+				namespaceGroups.computeIfAbsent(stack.getId().getNamespace(), (k) -> new IndexGroup()).stacks.add(stack);
+			} catch (Exception e) {
+				EmiLog.error("Item " + itemName + " threw while EMI was attempting to construct the index, items may be missing.", e);
+			}
+		}
 	}
 
 	public static void apply(List<EmiStack> stacks) {
@@ -197,7 +230,29 @@ public class EmiStackList {
 	}
 
 	public static void bake() {
-		List<EmiStack> bakingStacks = stacks
+		EmiReloadManager.profileStep("prepare_stack_filters");
+		List<IndexStackData> ssds = EmiData.stackData.stream().map(Supplier::get).toList();
+
+		List<Predicate<String>> filters = ssds.stream().flatMap((isd) -> isd.filters().stream().map(IndexStackData.Filter::filter)).toList();
+
+		Predicate<EmiStack> filterPredicate;
+		if (filters.isEmpty()) {
+			filterPredicate = (e) -> true;
+		} else {
+			filterPredicate = (e) -> {
+				String id = e.getId().toString();
+				for (Predicate<String> predicate : filters) {
+					if (predicate.test(id)) {
+						return false;
+					}
+				}
+				return true;
+			};
+		}
+		EmiReloadManager.popStep("prepare_stack_filters");
+
+		List<EmiStack> bakingStacks = EmiReloadManager.profileStep("bake_stacks", () -> {
+			return stacks
 				.parallelStream()
 				.filter((s) -> {
 					try {
@@ -209,82 +264,64 @@ public class EmiStackList {
 								return false;
 							}
 						}
-						return true;
+						if (!nameIdPredicate.test(s)) {
+							return false;
+						}
+						return filterPredicate.test(s);
 					} catch (Throwable t) {
 						EmiLog.error("Stack threw error while baking", t);
 						return false;
 					}
 				})
 				.collect(Collectors.toCollection(Lists::newLinkedList));
+		});
 
-		for (Supplier<IndexStackData> supplier : EmiData.stackData) {
-			IndexStackData ssd = supplier.get();
-			if (!ssd.removed().isEmpty()) {
-				Set<EmiStack> removed = Sets.newHashSet();
-				for (EmiIngredient invalidator : ssd.removed()) {
-					for (EmiStack stack : invalidator.getEmiStacks()) {
-						removed.add(stack.copy().comparison(c -> EmiPort.compareStrict()));
-					}
-				}
-				bakingStacks.removeAll(removed);
-			}
-			if (!ssd.filters().isEmpty()) {
-				bakingStacks.removeIf(s -> {
-					String id = "" + s.getId();
-					for (IndexStackData.Filter filter : ssd.filters()) {
-						if (filter.filter().test(id)) {
-							return true;
+		EmiReloadManager.profileStep("apply_stack_data", () -> {
+			for (IndexStackData ssd : ssds) {
+				if (!ssd.removed().isEmpty()) {
+					Set<EmiStack> removed = Sets.newHashSet();
+					for (EmiIngredient invalidator : ssd.removed()) {
+						for (EmiStack stack : invalidator.getEmiStacks()) {
+							removed.add(stack.copy().comparison(c -> EmiPort.compareStrict()));
 						}
 					}
-					return false;
-				});
-			}
-			for (IndexStackData.Added added : ssd.added()) {
-				if (added.added().isEmpty()) {
-					continue;
+					bakingStacks.removeAll(removed);
 				}
-				if (added.after().isEmpty()) {
-					EmiStack stack = added.added().getEmiStacks().get(0);
-					if (!stack.isEmpty()) {
-						bakingStacks.add(stack);
+				for (IndexStackData.Added added : ssd.added()) {
+					if (added.added().isEmpty()) {
+						continue;
 					}
-				} else {
-					EmiStack stack = added.added().getEmiStacks().get(0);
-					if (!stack.isEmpty()) {
-						int i = bakingStacks.indexOf(added.after());
-						if (i == -1) {
-							i = bakingStacks.size() - 1;
+					if (added.after().isEmpty()) {
+						EmiStack stack = added.added().getEmiStacks().get(0);
+						if (!stack.isEmpty()) {
+							bakingStacks.add(stack);
 						}
-						bakingStacks.add(i + 1, added.added().getEmiStacks().get(0));
+					} else {
+						EmiStack stack = added.added().getEmiStacks().get(0);
+						if (!stack.isEmpty()) {
+							int i = bakingStacks.indexOf(added.after());
+							if (i == -1) {
+								i = bakingStacks.size() - 1;
+							}
+							bakingStacks.add(i + 1, added.added().getEmiStacks().get(0));
+						}
 					}
 				}
 			}
-		}
-		stacks = bakingStacks.stream().filter(stack -> {
-			String name = "Unknown";
-			String id = "unknown";
-			try {
-				name = stack.toString();
-				id = stack.getId().toString();
-				if (name != null && stack.getKey() != null && stack.getName() != null) {
-					return true;
-				}
-				EmiLog.warn("Hiding stack " + name + " with id " + id + " from index due to returning dangerous values");
-				return false;
-			} catch (Throwable t) {
-				EmiLog.error("Hiding stack " + name + " with id " + id + " from index due to throwing errors", t);
-				return false;
+		});
+
+		stacks = bakingStacks;
+		EmiReloadManager.profileStep("indices_bake", () -> {
+			for (int i = 0; i < stacks.size(); i++) {
+				EmiStack stack = stacks.get(i);
+				strictIndices.put(stack, i);
+				keyIndices.put(stack.getKey(), i);
 			}
-		}).toList();
-		for (int i = 0; i < stacks.size(); i++) {
-			EmiStack stack = stacks.get(i);
-			strictIndices.put(stack, i);
-			keyIndices.put(stack.getKey(), i);
-		}
+		});
 	}
 
 	public static void bakeFiltered() {
-		filteredStacks = stacks.stream().parallel().filter(s -> !(EmiHidden.isHidden(s) || EmiHidden.isDisabled(s))).collect(Collectors.toCollection(Lists::newArrayList));
+		filteredStacks = stacks.stream().filter(s -> !(EmiHidden.isHidden(s) || EmiHidden.isDisabled(s))).collect(Collectors.toCollection(Lists::newArrayList));
 	}
 
 	public static int getIndex(EmiIngredient ingredient) {
